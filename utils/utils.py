@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-from utils.DataLoader import Data
+from utils.DataLoader import Data, TripartiteData
 
 
 def set_random_seed(seed: int = 0):
@@ -300,6 +300,55 @@ def get_neighbor_sampler(data: Data, sample_neighbor_strategy: str = 'uniform', 
         adj_list[dst_node_id].append((src_node_id, edge_id, node_interact_time))
 
     return NeighborSampler(adj_list=adj_list, sample_neighbor_strategy=sample_neighbor_strategy, time_scaling_factor=time_scaling_factor, seed=seed)
+
+
+def get_tripartite_neighbor_sampler(
+    data: TripartiteData,
+    sample_neighbor_strategy: str = "uniform",
+    time_scaling_factor: float = 0.0,
+    seed: int = None,
+):
+    """
+    Fallback NeighborSampler when ``ml_*_temporal_edges.npz`` is absent: only hyperedge
+    pairwise links (three pairs per hyperedge). Prefer ``get_neighbor_sampler`` on
+    temporal ``Data`` from preprocess (includes all interaction types / labels).
+
+    Each hyperedge (u, streamer, room, t) is expanded into three undirected pairwise
+    links (u, streamer), (u, room), (streamer, room). All six directed entries share
+    the same edge_id and timestamp so DyGFormer-style edge_raw_features[edge_id] stays
+    well-defined (canonical hyperedge feature row).
+
+    Node ids must already live in the unified global index space (see preprocess).
+    """
+    max_node_id = max(
+        int(data.user_node_ids.max()),
+        int(data.streamer_node_ids.max()),
+        int(data.item_node_ids.max()),
+    )
+    adj_list = [[] for _ in range(max_node_id + 1)]
+    for u, s, r, edge_id, t in zip(
+        data.user_node_ids,
+        data.streamer_node_ids,
+        data.item_node_ids,
+        data.edge_ids,
+        data.node_interact_times,
+    ):
+        u, s, r = int(u), int(s), int(r)
+        edge_id = int(edge_id)
+        t = float(t)
+        adj_list[u].append((s, edge_id, t))
+        adj_list[s].append((u, edge_id, t))
+        adj_list[u].append((r, edge_id, t))
+        adj_list[r].append((u, edge_id, t))
+        adj_list[s].append((r, edge_id, t))
+        adj_list[r].append((s, edge_id, t))
+
+    return NeighborSampler(
+        adj_list=adj_list,
+        sample_neighbor_strategy=sample_neighbor_strategy,
+        time_scaling_factor=time_scaling_factor,
+        seed=seed,
+    )
 
 
 class NegativeEdgeSampler(object):

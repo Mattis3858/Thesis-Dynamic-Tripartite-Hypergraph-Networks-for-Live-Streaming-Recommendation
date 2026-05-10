@@ -113,3 +113,6 @@ DG_data/*/*
 !DG_data/myket/*
 processed_data/*/*
 !processed_data/myket/*
+
+saved_results/*/*
+saved_models/*/*
