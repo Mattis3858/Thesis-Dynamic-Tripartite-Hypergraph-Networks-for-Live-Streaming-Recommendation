@@ -109,8 +109,8 @@ def get_tripartite_train_args():
     parser.add_argument(
         "--num_depths",
         type=int,
-        default=20,
-        help="TCL: depth embedding size (should be >= num_neighbors + 1).",
+        default=None,
+        help="TCL: depth embedding size (= num_neighbors + 1 in DyGLib). Default: num_neighbors + 1.",
     )
     parser.add_argument(
         "--metrics_out",
@@ -120,8 +120,16 @@ def get_tripartite_train_args():
     )
     args = parser.parse_args()
     args.device = f"cuda:{args.gpu}" if torch.cuda.is_available() and args.gpu >= 0 else "cpu"
-    if args.model_name == "TCL" and args.num_depths < args.num_neighbors + 1:
-        raise ValueError("For TCL, num_depths must be >= num_neighbors + 1.")
+    # DyGLib TCL: depth_embedding covers target + num_neighbors hops (see train_link_prediction.py)
+    if args.num_depths is None:
+        args.num_depths = args.num_neighbors + 1
+    elif args.model_name == "TCL" and args.num_depths < args.num_neighbors + 1:
+        warnings.warn(
+            f"TCL: num_depths={args.num_depths} < num_neighbors+1={args.num_neighbors + 1}; "
+            f"using num_depths={args.num_neighbors + 1}.",
+            stacklevel=2,
+        )
+        args.num_depths = args.num_neighbors + 1
     return args
 
 
@@ -730,10 +738,12 @@ def main():
     logging.info("Metrics over %s runs:", args.num_runs)
     for name in val_metric_all_runs[0].keys():
         xs = [r[name] for r in val_metric_all_runs]
-        logging.info("validate %s %s | mean %.4f ± %.4f", name, xs, np.mean(xs), np.std(xs, ddof=1))
+        std = np.std(xs, ddof=1) if len(xs) > 1 else 0.0
+        logging.info("validate %s %s | mean %.4f ± %.4f", name, xs, np.mean(xs), std)
     for name in test_metric_all_runs[0].keys():
         xs = [r[name] for r in test_metric_all_runs]
-        logging.info("test %s %s | mean %.4f ± %.4f", name, xs, np.mean(xs), np.std(xs, ddof=1))
+        std = np.std(xs, ddof=1) if len(xs) > 1 else 0.0
+        logging.info("test %s %s | mean %.4f ± %.4f", name, xs, np.mean(xs), std)
 
     if args.metrics_out:
         test_mean = mean_metric_dicts(test_metric_all_runs)

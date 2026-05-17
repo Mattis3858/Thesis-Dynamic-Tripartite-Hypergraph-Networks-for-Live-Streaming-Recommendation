@@ -30,6 +30,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 TRAIN = ROOT / "train_tripartite_link_prediction.py"
 
+# Must match utils.metrics.TRIPARTITE_RANKING_KS
+TRIPARTITE_RANKING_KS = (5, 10, 20, 50, 100)
+
 OVERALL_MODELS = [
     "HTTransformer",
     "DyGFormer",
@@ -44,7 +47,7 @@ OVERALL_MODELS = [
 HYPERPARAM_PATCH_SIZES = [1, 5, 10, 20]
 HYPERPARAM_HIDDENS = [32, 64, 128, 256]
 
-CSV_COLUMNS = [
+_CSV_META_COLUMNS = [
     "timestamp",
     "mode",
     "dataset_name",
@@ -56,20 +59,20 @@ CSV_COLUMNS = [
     "use_bias_gate",
     "use_type_init",
     "use_hetero_coocc",
-    "test_roc_auc",
-    "test_average_precision",
-    "test_ndcg@5",
-    "test_ndcg@10",
-    "test_ndcg@20",
-    "test_ndcg@50",
-    "test_ndcg@100",
-    "test_precision@10",
-    "test_recall@10",
-    "val_roc_auc",
-    "val_average_precision",
-    "val_ndcg@10",
-    "val_ndcg@20",
 ]
+
+
+def _ranking_metric_columns(prefix: str) -> list[str]:
+    """All ranking keys written by train_tripartite_link_prediction --metrics_out (test_* / val_*)."""
+    cols = [f"{prefix}roc_auc", f"{prefix}average_precision"]
+    for k in TRIPARTITE_RANKING_KS:
+        cols.append(f"{prefix}precision@{k}")
+        cols.append(f"{prefix}recall@{k}")
+        cols.append(f"{prefix}ndcg@{k}")
+    return cols
+
+
+CSV_COLUMNS = _CSV_META_COLUMNS + _ranking_metric_columns("test_") + _ranking_metric_columns("val_")
 
 
 def _fmt_cell(v) -> str:
