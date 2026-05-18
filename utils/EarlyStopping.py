@@ -4,6 +4,15 @@ import torch.nn as nn
 import logging
 
 
+def get_memory_bank(model: nn.Module):
+    """Resolve memory bank for TGN / JODIE / DyRep (Sequential or tripartite wrapper)."""
+    if hasattr(model, "memory_bank"):
+        return model.memory_bank
+    if isinstance(model, nn.Sequential) and hasattr(model[0], "memory_bank"):
+        return model[0].memory_bank
+    raise AttributeError("Model has no memory_bank (expected TGN, JODIE, or DyRep).")
+
+
 class EarlyStopping(object):
 
     def __init__(self, patience: int, save_model_folder: str, save_model_name: str, logger: logging.Logger, model_name: str = None):
@@ -71,7 +80,7 @@ class EarlyStopping(object):
         self.logger.info(f"save model {self.save_model_path}")
         torch.save(model.state_dict(), self.save_model_path)
         if self.model_name in ['JODIE', 'DyRep', 'TGN']:
-            torch.save(model[0].memory_bank.node_raw_messages, self.save_model_nonparametric_data_path)
+            torch.save(get_memory_bank(model).node_raw_messages, self.save_model_nonparametric_data_path)
 
     def load_checkpoint(self, model: nn.Module, map_location: str = None):
         """
@@ -83,4 +92,6 @@ class EarlyStopping(object):
         self.logger.info(f"load model {self.save_model_path}")
         model.load_state_dict(torch.load(self.save_model_path, map_location=map_location))
         if self.model_name in ['JODIE', 'DyRep', 'TGN']:
-            model[0].memory_bank.node_raw_messages = torch.load(self.save_model_nonparametric_data_path, map_location=map_location)
+            get_memory_bank(model).node_raw_messages = torch.load(
+                self.save_model_nonparametric_data_path, map_location=map_location
+            )

@@ -17,9 +17,9 @@ import torch.nn as nn
 from models.CAWN import CAWN
 from models.DyGFormer import DyGFormer
 from models.GraphMixer import GraphMixer
-from models.MemoryModel import MemoryModel
 from models.TCL import TCL
 from models.TGAT import TGAT
+from models.TGN import TGN
 from utils.utils import NeighborSampler
 
 TRIPARTITE_BASELINE_MODELS = frozenset({"DyGFormer", "TGAT", "GraphMixer", "CAWN", "TCL", "TGN"})
@@ -120,12 +120,11 @@ class BaselineTripartiteWrapper(nn.Module):
                 device=device,
             )
         elif model_name == "TGN":
-            self.backbone = MemoryModel(
+            self.backbone = TGN(
                 node_raw_features=node_raw_features,
                 edge_raw_features=edge_raw_features,
                 neighbor_sampler=neighbor_sampler,
                 time_feat_dim=time_feat_dim,
-                model_name="TGN",
                 num_layers=num_layers,
                 num_heads=num_heads,
                 dropout=dropout,
@@ -151,6 +150,18 @@ class BaselineTripartiteWrapper(nn.Module):
         if self.backbone.neighbor_sampler.sample_neighbor_strategy in ("uniform", "time_interval_aware"):
             assert self.backbone.neighbor_sampler.seed is not None
             self.backbone.neighbor_sampler.reset_random_state()
+
+    @property
+    def memory_bank(self):
+        """TGN memory bank (for EarlyStopping checkpoints and epoch backup/restore)."""
+        if self.model_name != "TGN":
+            raise AttributeError("memory_bank is only defined for TGN.")
+        return self.backbone.memory_bank
+
+    def init_memory_for_epoch(self) -> None:
+        """Reset TGN memory at the start of each training epoch."""
+        if self.model_name == "TGN":
+            self.backbone.memory_bank.__init_memory_bank__()
 
     def detach_memory_after_batch(self):
         """Call after each training batch for TGN (matches DyGLib train_link_prediction)."""

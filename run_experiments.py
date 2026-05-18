@@ -2,7 +2,7 @@
 Batch launcher for train_tripartite_link_prediction.py.
 
 Modes:
-  overall   — HTTransformer + tripartite baselines (DyGFormer, TGAT, GraphMixer, CAWN, TCL, TGN).
+  overall   — HTTransformer, HyperHawkes, LightGCN, HAN + baselines (DyGFormer, TGAT, GraphMixer, CAWN, TCL, TGN).
   ablation  — HTTransformer only; full grid of --no-use_* flags (2^3 runs).
   hyperparam — HTTransformer only; patch_size × channel_embedding_dim grid (paper spec).
 
@@ -35,6 +35,9 @@ TRIPARTITE_RANKING_KS = (5, 10, 20, 50, 100)
 
 OVERALL_MODELS = [
     "HTTransformer",
+    "HyperHawkes",
+    "LightGCN",
+    "HAN",
     "DyGFormer",
     "TGAT",
     "GraphMixer",

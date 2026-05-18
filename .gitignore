@@ -116,3 +116,5 @@ processed_data/*/*
 
 saved_results/*/*
 saved_models/*/*
+
+reference_models

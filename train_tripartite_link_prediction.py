@@ -23,6 +23,9 @@ from tqdm import tqdm
 
 from models.BaselineTripartiteWrapper import BaselineTripartiteWrapper, TRIPARTITE_BASELINE_MODELS
 from models.HTTransformer import HTTransformer
+from models.HyperHawkes import HyperHawkes
+from models.HAN import HAN
+from models.LightGCN import LightGCN
 from utils.DataLoader import TripartiteData, get_idx_data_loader, get_tripartite_link_prediction_data
 from utils.EarlyStopping import EarlyStopping
 from utils.metrics import get_link_prediction_metrics, mean_metric_dicts, tripartite_ranking_metrics_per_query
@@ -36,8 +39,19 @@ def get_tripartite_train_args():
         "--model_name",
         type=str,
         default="HTTransformer",
-        choices=["HTTransformer", "DyGFormer", "TGAT", "GraphMixer", "CAWN", "TCL", "TGN"],
-        help="HTTransformer or a DyGLib temporal encoder wrapped for tripartite (u,v,w) scoring.",
+        choices=[
+            "HTTransformer",
+            "HyperHawkes",
+            "LightGCN",
+            "HAN",
+            "DyGFormer",
+            "TGAT",
+            "GraphMixer",
+            "CAWN",
+            "TCL",
+            "TGN",
+        ],
+        help="HTTransformer / HyperHawkes / LightGCN / HAN, or a DyGLib temporal encoder for tripartite (u,v,w) scoring.",
     )
     g_ht = parser.add_mutually_exclusive_group()
     g_ht.add_argument("--use_bias_gate", dest="use_bias_gate", action="store_true", help="HTTransformer: bias-aware merge head (default on).")
@@ -118,7 +132,53 @@ def get_tripartite_train_args():
         default=None,
         help="If set, write a JSON summary (test metrics averaged over num_runs) for orchestration scripts.",
     )
+    parser.add_argument(
+        "--hyperhawkes_sub_time_delta",
+        type=float,
+        default=3600.0,
+        help="HyperHawkes: session split threshold (seconds) for intent mining.",
+    )
+    parser.add_argument(
+        "--hyperhawkes_min_support",
+        type=float,
+        default=0.0005,
+        help="HyperHawkes: minimum support for frequent intent itemsets.",
+    )
+    parser.add_argument(
+        "--hyperhawkes_day_factor",
+        type=float,
+        default=100.0,
+        help="HyperHawkes: scales timestamps to day units in Hawkes excitation.",
+    )
+    parser.add_argument(
+        "--lightgcn_n_layers",
+        type=int,
+        default=None,
+        help="LightGCN: number of propagation layers (default: --num_layers).",
+    )
+    parser.add_argument(
+        "--han_n_heads",
+        type=int,
+        default=None,
+        help="HAN: number of GAT heads (default: --num_heads).",
+    )
+    parser.add_argument(
+        "--han_gat_layers",
+        type=int,
+        default=1,
+        help="HAN: node-level GAT layers per meta-path.",
+    )
+    parser.add_argument(
+        "--han_meta_path_nhood",
+        type=int,
+        default=1,
+        help="HAN: expand meta-path adjacency hops for attention mask (original HAN uses 1).",
+    )
     args = parser.parse_args()
+    if args.lightgcn_n_layers is None:
+        args.lightgcn_n_layers = args.num_layers
+    if args.han_n_heads is None:
+        args.han_n_heads = args.num_heads
     args.device = f"cuda:{args.gpu}" if torch.cuda.is_available() and args.gpu >= 0 else "cpu"
     # DyGLib TCL: depth_embedding covers target + num_neighbors hops (see train_link_prediction.py)
     if args.num_depths is None:
@@ -482,7 +542,45 @@ def main():
         logger.info("********** Run %s starts. **********", run + 1)
         logger.info("configuration: %s", args)
 
-        if args.model_name == "HTTransformer":
+        if args.model_name == "HAN":
+            num_nodes = int(node_raw_features.shape[0])
+            model = HAN(
+                train_data=train_data,
+                node_raw_features=node_raw_features,
+                num_nodes=num_nodes,
+                device=args.device,
+                hidden_dim=args.channel_embedding_dim,
+                n_heads=args.han_n_heads,
+                n_gat_layers=args.han_gat_layers,
+                dropout=args.dropout,
+                meta_path_nhood=args.han_meta_path_nhood,
+            )
+        elif args.model_name == "LightGCN":
+            num_nodes = int(node_raw_features.shape[0])
+            model = LightGCN(
+                train_data=train_data,
+                num_nodes=num_nodes,
+                device=args.device,
+                embedding_dim=args.channel_embedding_dim,
+                n_layers=args.lightgcn_n_layers,
+                dropout=args.dropout,
+            )
+        elif args.model_name == "HyperHawkes":
+            model = HyperHawkes(
+                train_data=train_data,
+                node_type_ids=node_type_ids,
+                device=args.device,
+                hidden_size=args.channel_embedding_dim,
+                max_seq_length=args.max_input_sequence_length,
+                num_heads=args.num_heads,
+                n_levels=2,
+                hgnn_layers=args.num_layers,
+                dropout=args.dropout,
+                sub_time_delta=args.hyperhawkes_sub_time_delta,
+                day_factor=args.hyperhawkes_day_factor,
+                min_support=args.hyperhawkes_min_support,
+            )
+        elif args.model_name == "HTTransformer":
             model = HTTransformer(
                 node_raw_features=node_raw_features,
                 edge_raw_features=edge_raw_features,
@@ -556,6 +654,11 @@ def main():
         test_eval_rng = np.random.RandomState(seed=args.eval_seed + 1)
 
         for epoch in range(args.num_epochs):
+            if args.model_name == "HyperHawkes" and hasattr(model, "e_step"):
+                model.e_step()
+            if args.model_name == "TGN" and hasattr(model, "init_memory_for_epoch"):
+                model.init_memory_for_epoch()
+
             train_loss, train_metrics = train_one_epoch(
                 model=model,
                 neighbor_sampler=train_neighbor_sampler,
@@ -567,6 +670,10 @@ def main():
                 device=args.device,
                 train_rng=train_rng,
             )
+
+            train_backup_memory_bank = None
+            if args.model_name == "TGN" and hasattr(model, "memory_bank"):
+                train_backup_memory_bank = model.memory_bank.backup_memory_bank()
 
             val_loss, val_rank_metrics = evaluate_tripartite_ranking(
                 model=model,
@@ -589,6 +696,12 @@ def main():
                 num_negatives=args.num_ranking_negatives,
                 eval_rng=val_eval_rng,
             )
+
+            val_backup_memory_bank = None
+            if args.model_name == "TGN" and hasattr(model, "memory_bank"):
+                val_backup_memory_bank = model.memory_bank.backup_memory_bank()
+                if train_backup_memory_bank is not None:
+                    model.memory_bank.reload_memory_bank(train_backup_memory_bank)
 
             logger.info(
                 "Epoch %s | train loss %.4f | val rank loss %.4f | val AP %.4f | val NDCG@10 %.4f",
@@ -630,6 +743,9 @@ def main():
                 logger.info("epoch %s new node test rank loss %.4f", epoch + 1, nn_test_loss_ep)
                 for mk, mv in nn_test_rank_metrics.items():
                     logger.info("epoch %s new node test %s %.4f", epoch + 1, mk, mv)
+
+            if args.model_name == "TGN" and val_backup_memory_bank is not None:
+                model.memory_bank.reload_memory_bank(val_backup_memory_bank)
 
             val_indicator = [(name, val, True) for name, val in val_rank_metrics.items()]
             if early_stopping.step(val_indicator, model):

@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 
 from models.TGAT import TGAT
+from models.TGN import TGN
 from models.MemoryModel import MemoryModel, compute_src_dst_node_time_shifts
 from models.CAWN import CAWN
 from models.TCL import TCL
@@ -97,7 +98,11 @@ if __name__ == "__main__":
         if args.model_name == 'TGAT':
             dynamic_backbone = TGAT(node_raw_features=node_raw_features, edge_raw_features=edge_raw_features, neighbor_sampler=train_neighbor_sampler,
                                     time_feat_dim=args.time_feat_dim, num_layers=args.num_layers, num_heads=args.num_heads, dropout=args.dropout, device=args.device)
-        elif args.model_name in ['JODIE', 'DyRep', 'TGN']:
+        elif args.model_name == 'TGN':
+            dynamic_backbone = TGN(node_raw_features=node_raw_features, edge_raw_features=edge_raw_features, neighbor_sampler=train_neighbor_sampler,
+                                   time_feat_dim=args.time_feat_dim, num_layers=args.num_layers, num_heads=args.num_heads,
+                                   dropout=args.dropout, device=args.device)
+        elif args.model_name in ['JODIE', 'DyRep']:
             # four floats that represent the mean and standard deviation of source and destination node time shifts in the training data, which is used for JODIE
             src_node_mean_time_shift, src_node_std_time_shift, dst_node_mean_time_shift_dst, dst_node_std_time_shift = \
                 compute_src_dst_node_time_shifts(train_data.src_node_ids, train_data.dst_node_ids, train_data.node_interact_times)

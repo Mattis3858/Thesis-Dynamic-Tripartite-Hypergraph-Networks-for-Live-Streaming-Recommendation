@@ -1,5 +1,10 @@
 torch>=1.8.1
 numpy
+scipy
 pandas
 tqdm
 tabulate
+# HyperHawkes baseline (tripartite)
+torch-geometric>=2.3.1
+mlxtend>=0.23.4
+torch-kmeans>=0.2.0
