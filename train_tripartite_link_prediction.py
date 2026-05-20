@@ -456,18 +456,21 @@ def main():
         data_dir=args.data_dir,
     )
 
+    num_nodes = len(node_type_ids)
     if temporal_full_data is not None and temporal_train_data is not None:
         train_neighbor_sampler = get_neighbor_sampler(
             data=temporal_train_data,
             sample_neighbor_strategy=args.sample_neighbor_strategy,
             time_scaling_factor=args.time_scaling_factor,
             seed=0,
+            num_nodes=num_nodes,
         )
         full_neighbor_sampler = get_neighbor_sampler(
             data=temporal_full_data,
             sample_neighbor_strategy=args.sample_neighbor_strategy,
             time_scaling_factor=args.time_scaling_factor,
             seed=1,
+            num_nodes=num_nodes,
         )
     else:
         train_neighbor_sampler = get_tripartite_neighbor_sampler(
@@ -475,12 +478,14 @@ def main():
             sample_neighbor_strategy=args.sample_neighbor_strategy,
             time_scaling_factor=args.time_scaling_factor,
             seed=0,
+            num_nodes=num_nodes,
         )
         full_neighbor_sampler = get_tripartite_neighbor_sampler(
             data=full_data,
             sample_neighbor_strategy=args.sample_neighbor_strategy,
             time_scaling_factor=args.time_scaling_factor,
             seed=1,
+            num_nodes=num_nodes,
         )
 
     train_loader = get_idx_data_loader(

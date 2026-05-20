@@ -311,9 +311,9 @@ def preprocess_kuailive_tripartite(
 
 def main():
     p = argparse.ArgumentParser(description="Preprocess KuaiLive CSV+NPY for tripartite HT-Transformer.")
-    p.add_argument("--edges", type=Path, default=Path("ml_kuailive_edges.csv"))
-    p.add_argument("--node_features", type=Path, default=Path("ml_kuailive_node.npy"))
-    p.add_argument("--edge_features", type=Path, default=Path("ml_kuailive_features.npy"))
+    p.add_argument("--edges", type=Path, default=Path("kuailive_data/ml_kuailive_edges.csv"))
+    p.add_argument("--node_features", type=Path, default=Path("kuailive_data/ml_kuailive_node.npy"))
+    p.add_argument("--edge_features", type=Path, default=Path("kuailive_data/ml_kuailive_features.npy"))
     p.add_argument("--out_dir", type=Path, default=Path("processed_data/kuailive_tripartite"))
     p.add_argument("--dataset_name", type=str, default="kuailive_tripartite")
     args = p.parse_args()

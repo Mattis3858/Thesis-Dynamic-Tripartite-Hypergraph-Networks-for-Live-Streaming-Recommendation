@@ -280,7 +280,13 @@ class NeighborSampler:
         self.random_state = np.random.RandomState(self.seed)
 
 
-def get_neighbor_sampler(data: Data, sample_neighbor_strategy: str = 'uniform', time_scaling_factor: float = 0.0, seed: int = None):
+def get_neighbor_sampler(
+    data: Data,
+    sample_neighbor_strategy: str = 'uniform',
+    time_scaling_factor: float = 0.0,
+    seed: int = None,
+    num_nodes: int | None = None,
+):
     """
     get neighbor sampler
     :param data: Data
@@ -288,9 +294,13 @@ def get_neighbor_sampler(data: Data, sample_neighbor_strategy: str = 'uniform', 
     :param time_scaling_factor: float, a hyper-parameter that controls the sampling preference with time interval,
     a large time_scaling_factor tends to sample more on recent links, this parameter works when sample_neighbor_strategy == 'time_interval_aware'
     :param seed: int, random seed
+    :param num_nodes: optional total node count (e.g. len(node_type_ids)); sizes adj_list so any global
+        node id is indexable even if it has no edges in ``data`` (empty neighbor history).
     :return:
     """
-    max_node_id = max(data.src_node_ids.max(), data.dst_node_ids.max())
+    max_node_id = max(int(data.src_node_ids.max()), int(data.dst_node_ids.max()))
+    if num_nodes is not None:
+        max_node_id = max(max_node_id, num_nodes - 1)
     # the adjacency vector stores edges for each node (source or destination), undirected
     # adj_list, list of list, where each element is a list of triple tuple (node_id, edge_id, timestamp)
     # the list at the first position in adj_list is empty
@@ -307,6 +317,7 @@ def get_tripartite_neighbor_sampler(
     sample_neighbor_strategy: str = "uniform",
     time_scaling_factor: float = 0.0,
     seed: int = None,
+    num_nodes: int | None = None,
 ):
     """
     Fallback NeighborSampler when ``ml_*_temporal_edges.npz`` is absent: only hyperedge
@@ -325,6 +336,8 @@ def get_tripartite_neighbor_sampler(
         int(data.streamer_node_ids.max()),
         int(data.item_node_ids.max()),
     )
+    if num_nodes is not None:
+        max_node_id = max(max_node_id, num_nodes - 1)
     adj_list = [[] for _ in range(max_node_id + 1)]
     for u, s, r, edge_id, t in zip(
         data.user_node_ids,
