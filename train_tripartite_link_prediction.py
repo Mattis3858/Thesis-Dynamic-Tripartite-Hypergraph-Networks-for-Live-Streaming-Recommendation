@@ -23,9 +23,6 @@ from tqdm import tqdm
 
 from models.BaselineTripartiteWrapper import BaselineTripartiteWrapper, TRIPARTITE_BASELINE_MODELS
 from models.HTTransformer import HTTransformer
-from models.HyperHawkes import HyperHawkes
-from models.HAN import HAN
-from models.LightGCN import LightGCN
 from utils.DataLoader import TripartiteData, get_idx_data_loader, get_tripartite_link_prediction_data
 from utils.EarlyStopping import EarlyStopping
 from utils.metrics import get_link_prediction_metrics, mean_metric_dicts, tripartite_ranking_metrics_per_query
@@ -548,6 +545,8 @@ def main():
         logger.info("configuration: %s", args)
 
         if args.model_name == "HAN":
+            from models.HAN import HAN
+
             num_nodes = int(node_raw_features.shape[0])
             model = HAN(
                 train_data=train_data,
@@ -561,6 +560,8 @@ def main():
                 meta_path_nhood=args.han_meta_path_nhood,
             )
         elif args.model_name == "LightGCN":
+            from models.LightGCN import LightGCN
+
             num_nodes = int(node_raw_features.shape[0])
             model = LightGCN(
                 train_data=train_data,
@@ -571,6 +572,8 @@ def main():
                 dropout=args.dropout,
             )
         elif args.model_name == "HyperHawkes":
+            from models.HyperHawkes import HyperHawkes
+
             model = HyperHawkes(
                 train_data=train_data,
                 node_type_ids=node_type_ids,
