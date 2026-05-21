@@ -89,6 +89,7 @@ class AttentionMixer(nn.Module):
     def forward(self, item_seq, item_seq_emb, item_seq_len):
         device = item_seq.device
         mask = item_seq.gt(0)
+        has_history = mask.any(dim=1)
         queries = []
         for i in range(self.n_levels):
             seq_ids = torch.arange(mask.size(0), device=device, dtype=torch.long)
@@ -110,6 +111,7 @@ class AttentionMixer(nn.Module):
         alpha = self.lp_pool(alpha)
         alpha = torch.masked_fill(alpha, ~mask.bool().unsqueeze(-1), float("-inf"))
         alpha = torch.softmax(alpha, dim=1)
+        alpha = torch.nan_to_num(alpha, nan=0.0, posinf=0.0, neginf=0.0)
         alpha = fn.dropout(alpha, p=self.dropout, training=self.training)
         output = torch.sum(
             (
@@ -119,4 +121,7 @@ class AttentionMixer(nn.Module):
             * mask.view(mask.shape[0], -1, 1).float(),
             1,
         )
+        if not has_history.all():
+            output = output.clone()
+            output[~has_history] = 0.0
         return output

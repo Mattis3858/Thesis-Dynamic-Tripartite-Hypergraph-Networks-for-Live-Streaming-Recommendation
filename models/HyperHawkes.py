@@ -275,18 +275,29 @@ class HyperHawkes(nn.Module):
         item_seq: torch.Tensor,
         target_item: torch.Tensor,
     ) -> torch.Tensor:
-        mask = item_seq.gt(0).unsqueeze(2)
-        mask = torch.where(mask, 0.0, -10000.0)
+        valid = item_seq.gt(0)
+        has_history = valid.any(dim=1)
         user_emb = self.user_embedding(user_id)
+        user_emb = F.dropout(user_emb, self.emb_dropout_prob, training=self.training)
+        if not has_history.any():
+            return user_emb
+
+        mask = torch.where(valid.unsqueeze(2), 0.0, -10000.0)
         item_seq_emb = self.item_embedding(item_seq)
         target_item_emb = self.item_embedding(target_item)
-        user_emb = F.dropout(user_emb, self.emb_dropout_prob, training=self.training)
         item_seq_emb = F.dropout(item_seq_emb, self.emb_dropout_prob, training=self.training)
         target_item_emb = F.dropout(target_item_emb, self.emb_dropout_prob, training=self.training)
         attn_scores = torch.matmul(item_seq_emb, target_item_emb.unsqueeze(2))
-        attn_probs = torch.softmax(attn_scores + mask, dim=1).transpose(2, 1)
+        attn_probs = torch.softmax(attn_scores + mask, dim=1)
+        attn_probs = torch.nan_to_num(attn_probs, nan=0.0, posinf=0.0, neginf=0.0)
+        attn_probs = attn_probs.transpose(2, 1)
         attn_user_rep = torch.matmul(attn_probs, item_seq_emb).squeeze(1)
-        return attn_user_rep + user_emb
+        attn_user_rep = torch.nan_to_num(attn_user_rep, nan=0.0, posinf=0.0, neginf=0.0)
+        out = user_emb + attn_user_rep
+        if not has_history.all():
+            out = out.clone()
+            out[~has_history] = user_emb[~has_history]
+        return out
 
     def _shortterm(self, item_seq: torch.Tensor, item_seq_len: torch.Tensor) -> torch.Tensor:
         item_seq_emb = self.item_embedding(item_seq)
@@ -330,8 +341,18 @@ class HyperHawkes(nn.Module):
         pis = (dist_params[:, 4] + 0.5).clamp(min=1e-10, max=1)
         exp_dist = torch.distributions.exponential.Exponential(betas, validate_args=False)
         norm_dist = torch.distributions.normal.Normal(mus, sigmas)
-        excitation = pis * exp_dist.log_prob(delta_t).exp() + (1 - pis) * norm_dist.log_prob(delta_t).exp()
-        return alphas * excitation * mask
+        log_p = torch.where(
+            delta_t > 0,
+            torch.log(
+                (
+                    pis * exp_dist.log_prob(delta_t).exp()
+                    + (1 - pis) * norm_dist.log_prob(delta_t).exp()
+                ).clamp(min=1e-12)
+            ),
+            torch.zeros_like(delta_t),
+        )
+        excitation = torch.exp(log_p.clamp(max=20.0))
+        return torch.nan_to_num(alphas * excitation * mask, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _encode_batch(
         self,
@@ -379,6 +400,9 @@ class HyperHawkes(nn.Module):
         else:
             h_u = torch.zeros(len(user_globals), self.hidden_size, device=self.device)
 
+        h_u = torch.nan_to_num(h_u, nan=0.0, posinf=0.0, neginf=0.0)
+        h_v = torch.nan_to_num(h_v, nan=0.0, posinf=0.0, neginf=0.0)
+        h_w = torch.nan_to_num(h_w, nan=0.0, posinf=0.0, neginf=0.0)
         return h_u, h_v, h_w
 
     def forward(
@@ -393,5 +417,7 @@ class HyperHawkes(nn.Module):
         del edge_ids, edges_are_positive
         h_u, h_v, h_w = self._encode_batch(user_node_ids, streamer_node_ids, item_node_ids, interact_times)
         h = torch.cat([h_u, h_v, h_w], dim=-1)
+        h = torch.nan_to_num(h, nan=0.0, posinf=0.0, neginf=0.0)
         y_hat = torch.sigmoid(self.pred_head(h))
+        y_hat = torch.clamp(y_hat, min=1e-7, max=1.0 - 1e-7)
         return y_hat, h_u, h_v, h_w
