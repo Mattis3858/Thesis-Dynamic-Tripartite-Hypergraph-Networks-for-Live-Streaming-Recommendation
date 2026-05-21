@@ -1,9 +1,9 @@
 """
 Tripartite (User, Streamer, Room) link prediction: HTTransformer or DyGLib baselines via BaselineTripartiteWrapper.
 
-- Training: BCE loss with one random negative (streamer, room) pair per positive triplet.
-- Validation / Test: ranking with 1 ground-truth + 99 random negatives (100 candidates),
-  metrics: ROC-AUC, AP, Precision@K, Recall@K, NDCG@K for K in {5, 10, 20, 50, 100} (see utils.metrics).
+- Training: BCE with one random negative (v', w') per positive triplet.
+- Each epoch: fast validation BCE on val_data (same 1-negative protocol); early stopping minimizes val_loss.
+- After training: load best checkpoint, run full 1+99 ranking on test only (see utils.metrics).
 """
 
 from __future__ import annotations
@@ -105,7 +105,12 @@ def get_tripartite_train_args():
     parser.add_argument("--val_ratio", type=float, default=0.15)
     parser.add_argument("--test_ratio", type=float, default=0.15)
     parser.add_argument("--num_runs", type=int, default=5)
-    parser.add_argument("--test_interval_epochs", type=int, default=10)
+    parser.add_argument(
+        "--test_interval_epochs",
+        type=int,
+        default=10,
+        help="Unused: mid-epoch test ranking removed; final test ranking runs once after early stopping.",
+    )
     parser.add_argument("--num_ranking_negatives", type=int, default=99, help="99 negatives + 1 positive = 100 candidates")
     parser.add_argument("--eval_seed", type=int, default=0, help="seed for ranking negative sampling in val/test")
     parser.add_argument(
@@ -430,6 +435,60 @@ def train_one_epoch(
     return float(np.mean(losses)), train_metrics_mean
 
 
+@torch.no_grad()
+def evaluate_valid_loss(
+    model: nn.Module,
+    neighbor_sampler,
+    val_data: TripartiteData,
+    val_loader,
+    loss_fn: nn.Module,
+    node_type_ids: np.ndarray,
+    device: str,
+    val_rng: np.random.RandomState,
+) -> float:
+    """
+    Lightweight validation: one random negative (v', w') per val triplet, mean BCE (no optimizer step).
+    Same forward protocol as train_one_epoch.
+    """
+    model.eval()
+    model.set_neighbor_sampler(neighbor_sampler)
+
+    streamer_pool, room_pool = _type_pools(node_type_ids)
+    losses: list[float] = []
+
+    for batch_indices in tqdm(val_loader, ncols=120, desc="val loss"):
+        idx = batch_indices.numpy()
+        bu = val_data.user_node_ids[idx]
+        bv = val_data.streamer_node_ids[idx]
+        bw = val_data.item_node_ids[idx]
+        bt = val_data.node_interact_times[idx]
+
+        bv_neg, bw_neg = _sample_negative_pairs(bv, bw, streamer_pool, room_pool, val_rng)
+
+        batch_edge_ids = val_data.edge_ids[idx]
+        y_pos, _, _, _ = model(
+            bu, bv, bw, bt, edge_ids=batch_edge_ids, edges_are_positive=True
+        )
+        y_neg, _, _, _ = model(
+            bu, bv_neg, bw_neg, bt, edge_ids=None, edges_are_positive=False
+        )
+
+        y_pos = y_pos.view(-1)
+        y_neg = y_neg.view(-1)
+        predicts = torch.cat([y_pos, y_neg], dim=0)
+        labels = torch.cat(
+            [
+                torch.ones_like(y_pos, device=device, dtype=torch.float32),
+                torch.zeros_like(y_neg, device=device, dtype=torch.float32),
+            ],
+            dim=0,
+        )
+        loss = loss_fn(predicts.float(), labels)
+        losses.append(float(loss.item()))
+
+    return float(np.mean(losses))
+
+
 def main():
     warnings.filterwarnings("ignore")
     args = get_tripartite_train_args()
@@ -495,26 +554,14 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
     )
-    new_node_val_loader = get_idx_data_loader(
-        indices_list=list(range(len(new_node_val_data.user_node_ids))),
-        batch_size=args.batch_size,
-        shuffle=False,
-    )
     test_loader = get_idx_data_loader(
         indices_list=list(range(len(test_data.user_node_ids))),
         batch_size=args.batch_size,
         shuffle=False,
     )
-    new_node_test_loader = get_idx_data_loader(
-        indices_list=list(range(len(new_node_test_data.user_node_ids))),
-        batch_size=args.batch_size,
-        shuffle=False,
-    )
 
-    val_metric_all_runs: list[dict] = []
-    new_node_val_metric_all_runs: list[dict] = []
+    best_val_loss_all_runs: list[float] = []
     test_metric_all_runs: list[dict] = []
-    new_node_test_metric_all_runs: list[dict] = []
 
     for run in range(args.num_runs):
         set_random_seed(seed=run)
@@ -658,7 +705,7 @@ def main():
         )
 
         train_rng = np.random.RandomState(seed=run + 12345)
-        val_eval_rng = np.random.RandomState(seed=args.eval_seed)
+        val_loss_rng = np.random.RandomState(seed=args.eval_seed)
         test_eval_rng = np.random.RandomState(seed=args.eval_seed + 1)
 
         for epoch in range(args.num_epochs):
@@ -679,112 +726,35 @@ def main():
                 train_rng=train_rng,
             )
 
-            train_backup_memory_bank = None
-            if args.model_name == "TGN" and hasattr(model, "memory_bank"):
-                train_backup_memory_bank = model.memory_bank.backup_memory_bank()
-
-            val_loss, val_rank_metrics = evaluate_tripartite_ranking(
+            val_loss = evaluate_valid_loss(
                 model=model,
-                neighbor_sampler=full_neighbor_sampler,
-                data=val_data,
-                idx_data_loader=val_loader,
+                neighbor_sampler=train_neighbor_sampler,
+                val_data=val_data,
+                val_loader=val_loader,
+                loss_fn=loss_fn,
                 node_type_ids=node_type_ids,
                 device=args.device,
-                num_negatives=args.num_ranking_negatives,
-                eval_rng=val_eval_rng,
+                val_rng=val_loss_rng,
             )
-
-            new_node_val_loss, new_node_val_rank_metrics = evaluate_tripartite_ranking(
-                model=model,
-                neighbor_sampler=full_neighbor_sampler,
-                data=new_node_val_data,
-                idx_data_loader=new_node_val_loader,
-                node_type_ids=node_type_ids,
-                device=args.device,
-                num_negatives=args.num_ranking_negatives,
-                eval_rng=val_eval_rng,
-            )
-
-            val_backup_memory_bank = None
-            if args.model_name == "TGN" and hasattr(model, "memory_bank"):
-                val_backup_memory_bank = model.memory_bank.backup_memory_bank()
-                if train_backup_memory_bank is not None:
-                    model.memory_bank.reload_memory_bank(train_backup_memory_bank)
 
             logger.info(
-                "Epoch %s | train loss %.4f | val rank loss %.4f | val AP %.4f | val NDCG@10 %.4f",
+                "Epoch %s | train loss %.4f | val loss (BCE, 1 neg) %.4f",
                 epoch + 1,
                 train_loss,
                 val_loss,
-                val_rank_metrics.get("average_precision", float("nan")),
-                val_rank_metrics.get("ndcg@10", float("nan")),
             )
             for mk, mv in train_metrics.items():
                 logger.info("train %s %.4f", mk, mv)
-            for mk, mv in val_rank_metrics.items():
-                logger.info("val %s %.4f", mk, mv)
 
-            if (epoch + 1) % args.test_interval_epochs == 0:
-                test_loss_ep, test_rank_metrics = evaluate_tripartite_ranking(
-                    model=model,
-                    neighbor_sampler=full_neighbor_sampler,
-                    data=test_data,
-                    idx_data_loader=test_loader,
-                    node_type_ids=node_type_ids,
-                    device=args.device,
-                    num_negatives=args.num_ranking_negatives,
-                    eval_rng=test_eval_rng,
-                )
-                nn_test_loss_ep, nn_test_rank_metrics = evaluate_tripartite_ranking(
-                    model=model,
-                    neighbor_sampler=full_neighbor_sampler,
-                    data=new_node_test_data,
-                    idx_data_loader=new_node_test_loader,
-                    node_type_ids=node_type_ids,
-                    device=args.device,
-                    num_negatives=args.num_ranking_negatives,
-                    eval_rng=test_eval_rng,
-                )
-                logger.info("epoch %s test rank loss %.4f", epoch + 1, test_loss_ep)
-                for mk, mv in test_rank_metrics.items():
-                    logger.info("epoch %s test %s %.4f", epoch + 1, mk, mv)
-                logger.info("epoch %s new node test rank loss %.4f", epoch + 1, nn_test_loss_ep)
-                for mk, mv in nn_test_rank_metrics.items():
-                    logger.info("epoch %s new node test %s %.4f", epoch + 1, mk, mv)
-
-            if args.model_name == "TGN" and val_backup_memory_bank is not None:
-                model.memory_bank.reload_memory_bank(val_backup_memory_bank)
-
-            val_indicator = [(name, val, True) for name, val in val_rank_metrics.items()]
-            if early_stopping.step(val_indicator, model):
+            if early_stopping.step([("val_loss", val_loss, False)], model):
+                logger.info("Early stopping at epoch %s (best val_loss %.4f).", epoch + 1, early_stopping.best_metrics.get("val_loss"))
                 break
 
         early_stopping.load_checkpoint(model)
+        best_val_loss = early_stopping.best_metrics.get("val_loss", float("nan"))
+        best_val_loss_all_runs.append(float(best_val_loss))
+        logger.info("Loaded best checkpoint (lowest val_loss = %.4f). Final test ranking (1+%s negatives) ...", best_val_loss, args.num_ranking_negatives)
 
-        val_eval_rng = np.random.RandomState(seed=args.eval_seed)
-        test_eval_rng = np.random.RandomState(seed=args.eval_seed + 1)
-
-        logger.info("Final evaluation on %s ...", args.dataset_name)
-        val_loss, val_rank_metrics = evaluate_tripartite_ranking(
-            model=model,
-            neighbor_sampler=full_neighbor_sampler,
-            data=val_data,
-            idx_data_loader=val_loader,
-            node_type_ids=node_type_ids,
-            device=args.device,
-            num_negatives=args.num_ranking_negatives,
-            eval_rng=val_eval_rng,
-        )
-        new_node_val_loss, new_node_val_rank_metrics = evaluate_tripartite_ranking(
-            model=model,
-            neighbor_sampler=full_neighbor_sampler,
-            data=new_node_val_data,
-            idx_data_loader=new_node_val_loader,
-            node_type_ids=node_type_ids,
-            device=args.device,
-            num_negatives=args.num_ranking_negatives,
-            eval_rng=val_eval_rng,
-        )
         test_loss, test_rank_metrics, test_per_query_metrics = evaluate_tripartite_ranking(
             model=model,
             neighbor_sampler=full_neighbor_sampler,
@@ -799,37 +769,15 @@ def main():
         test_cold_start_metrics = evaluate_tripartite_cold_start_by_split(
             train_data, test_data, test_per_query_metrics
         )
-        new_node_test_loss, new_node_test_rank_metrics = evaluate_tripartite_ranking(
-            model=model,
-            neighbor_sampler=full_neighbor_sampler,
-            data=new_node_test_data,
-            idx_data_loader=new_node_test_loader,
-            node_type_ids=node_type_ids,
-            device=args.device,
-            num_negatives=args.num_ranking_negatives,
-            eval_rng=test_eval_rng,
-        )
 
-        logger.info("validate ranking loss %.4f", val_loss)
-        for mk, mv in val_rank_metrics.items():
-            logger.info("validate %s %.4f", mk, mv)
-        logger.info("new node validate ranking loss %.4f", new_node_val_loss)
-        for mk, mv in new_node_val_rank_metrics.items():
-            logger.info("new node validate %s %.4f", mk, mv)
-        logger.info("test ranking loss %.4f", test_loss)
+        logger.info("test ranking loss (diagnostic BCE on 1+99) %.4f", test_loss)
         for mk, mv in test_rank_metrics.items():
             logger.info("test %s %.4f", mk, mv)
         logger.info("test cold-start splits (AUC, P@10, R@10, N@10, subset means):")
         for split_name, split_m in test_cold_start_metrics.items():
             logger.info("  %s: %s", split_name, split_m)
-        logger.info("new node test ranking loss %.4f", new_node_test_loss)
-        for mk, mv in new_node_test_rank_metrics.items():
-            logger.info("new node test %s %.4f", mk, mv)
 
-        val_metric_all_runs.append(val_rank_metrics)
-        new_node_val_metric_all_runs.append(new_node_val_rank_metrics)
         test_metric_all_runs.append(test_rank_metrics)
-        new_node_test_metric_all_runs.append(new_node_test_rank_metrics)
 
         logger.info("Run %s cost %.2f s", run + 1, time.time() - run_start_time)
 
@@ -837,14 +785,12 @@ def main():
             return "nan" if isinstance(x, float) and np.isnan(x) else f"{x:.4f}"
 
         result_json = {
-            "validate metrics": {k: _json_float(v) for k, v in val_rank_metrics.items()},
-            "new node validate metrics": {k: _json_float(v) for k, v in new_node_val_rank_metrics.items()},
+            "best_val_loss": _json_float(best_val_loss),
             "test metrics": {k: _json_float(v) for k, v in test_rank_metrics.items()},
             "test cold-start splits": {
                 split: {m: _json_float(val) for m, val in metrics.items()}
                 for split, metrics in test_cold_start_metrics.items()
             },
-            "new node test metrics": {k: _json_float(v) for k, v in new_node_test_rank_metrics.items()},
         }
         save_result_folder = f"./saved_results/{args.model_name}/{args.dataset_name}"
         os.makedirs(save_result_folder, exist_ok=True)
@@ -860,18 +806,18 @@ def main():
             logger.removeHandler(ch)
 
     logging.info("Metrics over %s runs:", args.num_runs)
-    for name in val_metric_all_runs[0].keys():
-        xs = [r[name] for r in val_metric_all_runs]
+    if best_val_loss_all_runs:
+        xs = best_val_loss_all_runs
         std = np.std(xs, ddof=1) if len(xs) > 1 else 0.0
-        logging.info("validate %s %s | mean %.4f ± %.4f", name, xs, np.mean(xs), std)
-    for name in test_metric_all_runs[0].keys():
-        xs = [r[name] for r in test_metric_all_runs]
-        std = np.std(xs, ddof=1) if len(xs) > 1 else 0.0
-        logging.info("test %s %s | mean %.4f ± %.4f", name, xs, np.mean(xs), std)
+        logging.info("best_val_loss %s | mean %.4f ± %.4f", xs, np.mean(xs), std)
+    if test_metric_all_runs:
+        for name in test_metric_all_runs[0].keys():
+            xs = [r[name] for r in test_metric_all_runs]
+            std = np.std(xs, ddof=1) if len(xs) > 1 else 0.0
+            logging.info("test %s %s | mean %.4f ± %.4f", name, xs, np.mean(xs), std)
 
     if args.metrics_out:
         test_mean = mean_metric_dicts(test_metric_all_runs)
-        val_mean = mean_metric_dicts(val_metric_all_runs)
 
         def _json_scalar(x: float) -> float | None:
             if isinstance(x, float) and (np.isnan(x) or np.isinf(x)):
@@ -885,6 +831,7 @@ def main():
             "patch_size": args.patch_size,
             "channel_embedding_dim": args.channel_embedding_dim,
             "cooccurrence_dim": args.cooccurrence_dim,
+            "best_val_loss": _json_scalar(float(np.mean(best_val_loss_all_runs))) if best_val_loss_all_runs else None,
         }
         if args.model_name == "HTTransformer":
             summary["use_bias_gate"] = args.use_bias_gate
@@ -896,8 +843,6 @@ def main():
             summary["use_hetero_coocc"] = None
         for k, v in test_mean.items():
             summary[f"test_{k}"] = _json_scalar(v)
-        for k, v in val_mean.items():
-            summary[f"val_{k}"] = _json_scalar(v)
         os.makedirs(os.path.dirname(os.path.abspath(args.metrics_out)) or ".", exist_ok=True)
         with open(args.metrics_out, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2, ensure_ascii=False)
