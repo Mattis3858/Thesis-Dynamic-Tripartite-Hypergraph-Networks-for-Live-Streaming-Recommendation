@@ -28,8 +28,13 @@ TYPE_ROOM = 3
 
 
 def _gather_indexes(output: torch.Tensor, gather_index: torch.Tensor) -> torch.Tensor:
-    gather_index = gather_index.view(-1, 1).expand(-1, output.shape[-1])
-    return output.gather(dim=1, index=gather_index).squeeze(1)
+    """
+    Gather last valid timestep from ``output`` [batch, seq_len, hidden].
+    ``gather_index`` is per-row index (e.g. seq_len - 1); clamped for empty sequences.
+    """
+    idx = gather_index.clamp(min=0)
+    index = idx.view(-1, 1, 1).expand(-1, 1, output.size(-1))
+    return output.gather(dim=1, index=index).squeeze(1)
 
 
 class HyperHawkes(nn.Module):
@@ -287,7 +292,8 @@ class HyperHawkes(nn.Module):
         item_seq_emb = self.item_embedding(item_seq)
         item_seq_emb = self.seq_layer_norm(item_seq_emb)
         item_seq_emb = F.dropout(item_seq_emb, self.emb_dropout_prob, training=self.training)
-        last_item_emb = _gather_indexes(item_seq_emb, item_seq_len - 1)
+        last_idx = (item_seq_len - 1).clamp(min=0)
+        last_item_emb = _gather_indexes(item_seq_emb, last_idx)
         seq_output = self.local_encoder(item_seq, item_seq_emb, item_seq_len)
         return self.last_linear(torch.cat([seq_output, last_item_emb], dim=1))
 
