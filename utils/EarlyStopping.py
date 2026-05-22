@@ -13,6 +13,22 @@ def get_memory_bank(model: nn.Module):
     raise AttributeError("Model has no memory_bank (expected TGN, JODIE, or DyRep).")
 
 
+def _torch_load_checkpoint(path: str, map_location=None):
+    """
+    Load DyGLib checkpoints saved with torch.save (state_dict or memory pickles).
+
+    PyTorch 2.6+ defaults to weights_only=True, which rejects TGN memory objects
+    (collections.defaultdict). Our checkpoints are trusted local files.
+    """
+    kwargs = {}
+    if map_location is not None:
+        kwargs["map_location"] = map_location
+    try:
+        return torch.load(path, weights_only=False, **kwargs)
+    except TypeError:
+        return torch.load(path, **kwargs)
+
+
 class EarlyStopping(object):
 
     def __init__(self, patience: int, save_model_folder: str, save_model_name: str, logger: logging.Logger, model_name: str = None):
@@ -90,8 +106,8 @@ class EarlyStopping(object):
         :return:
         """
         self.logger.info(f"load model {self.save_model_path}")
-        model.load_state_dict(torch.load(self.save_model_path, map_location=map_location))
+        model.load_state_dict(_torch_load_checkpoint(self.save_model_path, map_location=map_location))
         if self.model_name in ['JODIE', 'DyRep', 'TGN']:
-            get_memory_bank(model).node_raw_messages = torch.load(
+            get_memory_bank(model).node_raw_messages = _torch_load_checkpoint(
                 self.save_model_nonparametric_data_path, map_location=map_location
             )
