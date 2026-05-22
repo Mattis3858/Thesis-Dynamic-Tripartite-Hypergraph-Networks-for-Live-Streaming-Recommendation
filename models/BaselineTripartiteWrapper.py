@@ -163,6 +163,16 @@ class BaselineTripartiteWrapper(nn.Module):
         if self.model_name == "TGN":
             self.backbone.memory_bank.__init_memory_bank__()
 
+    def backup_memory_bank(self):
+        """Snapshot TGN memory after training (for val without polluting train state)."""
+        if self.model_name != "TGN":
+            raise AttributeError("backup_memory_bank is only defined for TGN.")
+        return self.backbone.memory_bank.backup_memory_bank()
+
+    def reload_memory_bank(self, backup) -> None:
+        if self.model_name == "TGN":
+            self.backbone.memory_bank.reload_memory_bank(backup)
+
     def detach_memory_after_batch(self):
         """Call after each training batch for TGN (matches DyGLib train_link_prediction)."""
         if self.model_name == "TGN":

@@ -230,6 +230,15 @@ def _sample_negative_pairs(
     return v_neg, w_neg
 
 
+def _is_tgn_model(model: nn.Module) -> bool:
+    return getattr(model, "model_name", None) == "TGN"
+
+
+def _sort_batch_indices_by_time(idx: np.ndarray, interact_times: np.ndarray) -> np.ndarray:
+    """TGN memory updates require non-decreasing times within each batch."""
+    return idx[np.argsort(interact_times[idx], kind="stable")]
+
+
 def _train_tripartite_node_set(train_data: TripartiteData) -> set[int]:
     """Any global id that appears in train triplets (any role)."""
     s = set(np.unique(train_data.user_node_ids).astype(np.int64).tolist())
@@ -392,8 +401,11 @@ def train_one_epoch(
     losses: list[float] = []
     batch_metrics: list[dict] = []
 
+    tgn = _is_tgn_model(model)
     for batch_indices in tqdm(train_loader, ncols=120, desc="train"):
         idx = batch_indices.numpy()
+        if tgn:
+            idx = _sort_batch_indices_by_time(idx, train_data.node_interact_times)
         bu = train_data.user_node_ids[idx]
         bv = train_data.streamer_node_ids[idx]
         bw = train_data.item_node_ids[idx]
@@ -402,12 +414,20 @@ def train_one_epoch(
         bv_neg, bw_neg = _sample_negative_pairs(bv, bw, streamer_pool, room_pool, train_rng)
 
         batch_edge_ids = train_data.edge_ids[idx]
-        y_pos, _, _, _ = model(
-            bu, bv, bw, bt, edge_ids=batch_edge_ids, edges_are_positive=True
-        )
-        y_neg, _, _, _ = model(
-            bu, bv_neg, bw_neg, bt, edge_ids=None, edges_are_positive=False
-        )
+        if tgn:
+            y_neg, _, _, _ = model(
+                bu, bv_neg, bw_neg, bt, edge_ids=None, edges_are_positive=False
+            )
+            y_pos, _, _, _ = model(
+                bu, bv, bw, bt, edge_ids=batch_edge_ids, edges_are_positive=True
+            )
+        else:
+            y_pos, _, _, _ = model(
+                bu, bv, bw, bt, edge_ids=batch_edge_ids, edges_are_positive=True
+            )
+            y_neg, _, _, _ = model(
+                bu, bv_neg, bw_neg, bt, edge_ids=None, edges_are_positive=False
+            )
 
         y_pos = y_pos.view(-1)
         y_neg = y_neg.view(-1)
@@ -455,9 +475,12 @@ def evaluate_valid_loss(
 
     streamer_pool, room_pool = _type_pools(node_type_ids)
     losses: list[float] = []
+    tgn = _is_tgn_model(model)
 
     for batch_indices in tqdm(val_loader, ncols=120, desc="val loss"):
         idx = batch_indices.numpy()
+        if tgn:
+            idx = _sort_batch_indices_by_time(idx, val_data.node_interact_times)
         bu = val_data.user_node_ids[idx]
         bv = val_data.streamer_node_ids[idx]
         bw = val_data.item_node_ids[idx]
@@ -466,12 +489,20 @@ def evaluate_valid_loss(
         bv_neg, bw_neg = _sample_negative_pairs(bv, bw, streamer_pool, room_pool, val_rng)
 
         batch_edge_ids = val_data.edge_ids[idx]
-        y_pos, _, _, _ = model(
-            bu, bv, bw, bt, edge_ids=batch_edge_ids, edges_are_positive=True
-        )
-        y_neg, _, _, _ = model(
-            bu, bv_neg, bw_neg, bt, edge_ids=None, edges_are_positive=False
-        )
+        if tgn:
+            y_neg, _, _, _ = model(
+                bu, bv_neg, bw_neg, bt, edge_ids=None, edges_are_positive=False
+            )
+            y_pos, _, _, _ = model(
+                bu, bv, bw, bt, edge_ids=batch_edge_ids, edges_are_positive=True
+            )
+        else:
+            y_pos, _, _, _ = model(
+                bu, bv, bw, bt, edge_ids=batch_edge_ids, edges_are_positive=True
+            )
+            y_neg, _, _, _ = model(
+                bu, bv_neg, bw_neg, bt, edge_ids=None, edges_are_positive=False
+            )
 
         y_pos = y_pos.view(-1)
         y_neg = y_neg.view(-1)
@@ -544,10 +575,11 @@ def main():
             num_nodes=num_nodes,
         )
 
+    # TGN memory must see events in chronological order (DyGLib train_link_prediction uses shuffle=False).
     train_loader = get_idx_data_loader(
         indices_list=list(range(len(train_data.user_node_ids))),
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=args.model_name != "TGN",
     )
     val_loader = get_idx_data_loader(
         indices_list=list(range(len(val_data.user_node_ids))),
@@ -726,6 +758,10 @@ def main():
                 train_rng=train_rng,
             )
 
+            train_mem_backup = None
+            if args.model_name == "TGN":
+                train_mem_backup = model.backup_memory_bank()
+
             val_loss = evaluate_valid_loss(
                 model=model,
                 neighbor_sampler=train_neighbor_sampler,
@@ -736,6 +772,9 @@ def main():
                 device=args.device,
                 val_rng=val_loss_rng,
             )
+
+            if args.model_name == "TGN" and train_mem_backup is not None:
+                model.reload_memory_bank(train_mem_backup)
 
             logger.info(
                 "Epoch %s | train loss %.4f | val loss (BCE, 1 neg) %.4f",
