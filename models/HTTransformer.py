@@ -162,13 +162,17 @@ class Tripartite3DCooccurrenceEncoder(nn.Module):
 class BiasAwareTripartiteMergeLayer(nn.Module):
     """User-conditioned gates on streamer/item embeddings; MLP + sigmoid probability."""
 
-    def __init__(self, d_out: int, dropout: float = 0.1):
+    def __init__(self, d_out: int, dropout: float = 0.1, fusion_mode: str = "concat"):
         super().__init__()
+        if fusion_mode not in ("concat", "mean"):
+            raise ValueError(f"fusion_mode must be 'concat' or 'mean', got {fusion_mode!r}")
+        self.fusion_mode = fusion_mode
         self.W_v = nn.Linear(d_out, d_out, bias=True)
         self.W_w = nn.Linear(d_out, d_out, bias=True)
         hidden = max(d_out, 64)
+        mlp_in = 3 * d_out if fusion_mode == "concat" else d_out
         self.mlp_predict = nn.Sequential(
-            nn.Linear(3 * d_out, hidden),
+            nn.Linear(mlp_in, hidden),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, 1),
@@ -183,10 +187,15 @@ class BiasAwareTripartiteMergeLayer(nn.Module):
         """
         g_v = torch.sigmoid(self.W_v(h_u))  # shape: [batch_size, d_out]
         g_w = torch.sigmoid(self.W_w(h_u))  # shape: [batch_size, d_out]
-        h_tilde_v = g_v * h_v  # shape: [batch_size, d_out]
-        h_tilde_w = g_w * h_w  # shape: [batch_size, d_out]
-        h_cat = torch.cat([h_u, h_tilde_v, h_tilde_w], dim=-1)  # shape: [batch_size, 3 * d_out]
-        logits = self.mlp_predict(h_cat)  # shape: [batch_size, 1]
+        h_tilde_v = g_v  # shape: [batch_size, d_out]
+        h_tilde_w = g_w  # shape: [batch_size, d_out]        h_tilde_v = g_v * h_v  # shape: [batch_size, d_out]
+        # h_tilde_v = g_v * h_v  # shape: [batch_size, d_out]
+        # h_tilde_w = g_w * h_w  # shape: [batch_size, d_out]
+        if self.fusion_mode == "concat":
+            h_fused = torch.cat([h_u, h_tilde_v, h_tilde_w], dim=-1)  # shape: [batch_size, 3 * d_out]
+        else:
+            h_fused = (h_u + h_tilde_v + h_tilde_w) / 3.0  # shape: [batch_size, d_out]
+        logits = self.mlp_predict(h_fused)  # shape: [batch_size, 1]
         y_hat = torch.sigmoid(logits)  # shape: [batch_size, 1]
         return y_hat
 
@@ -215,6 +224,7 @@ class HTTransformer(nn.Module):
         use_bias_gate: bool = True,
         use_type_init: bool = True,
         use_hetero_coocc: bool = True,
+        fusion_mode: str = "concat",
     ):
         """
         :param node_raw_features: ndarray, shape (num_nodes + 1, node_feat_dim)
@@ -249,6 +259,9 @@ class HTTransformer(nn.Module):
         self.use_bias_gate = use_bias_gate
         self.use_type_init = use_type_init
         self.use_hetero_coocc = use_hetero_coocc
+        if fusion_mode not in ("concat", "mean"):
+            raise ValueError(f"fusion_mode must be 'concat' or 'mean', got {fusion_mode!r}")
+        self.fusion_mode = fusion_mode
 
         self.time_encoder = TimeEncoder(time_dim=time_feat_dim)
 
@@ -297,15 +310,18 @@ class HTTransformer(nn.Module):
         self.output_proj_v = nn.Linear(self.fused_dim, self.d_out, bias=True)
         self.output_proj_w = nn.Linear(self.fused_dim, self.d_out, bias=True)
 
-        # Module 6: bias-aware merge vs plain concat + MLP (ablation)
+        # Module 6: bias-aware merge vs plain fusion + MLP (ablation)
+        merge_in = 3 * self.d_out if fusion_mode == "concat" else self.d_out
         if use_bias_gate:
-            self.merge_layer = BiasAwareTripartiteMergeLayer(d_out=self.d_out, dropout=dropout)
+            self.merge_layer = BiasAwareTripartiteMergeLayer(
+                d_out=self.d_out, dropout=dropout, fusion_mode=fusion_mode
+            )
             self.plain_merge_mlp = None
         else:
             self.merge_layer = None
             merge_hid = max(self.d_out, 64)
             self.plain_merge_mlp = nn.Sequential(
-                nn.Linear(3 * self.d_out, merge_hid),
+                nn.Linear(merge_in, merge_hid),
                 nn.ReLU(),
                 nn.Dropout(dropout),
                 nn.Linear(merge_hid, 1),
@@ -535,7 +551,11 @@ class HTTransformer(nn.Module):
         if self.use_bias_gate:
             y_hat = self.merge_layer(h_u, h_v, h_w)  # shape: [batch_size, 1]
         else:
-            y_hat = torch.sigmoid(self.plain_merge_mlp(torch.cat([h_u, h_v, h_w], dim=-1)))
+            if self.fusion_mode == "concat":
+                h_fused = torch.cat([h_u, h_v, h_w], dim=-1)
+            else:
+                h_fused = (h_u + h_v + h_w) / 3.0
+            y_hat = torch.sigmoid(self.plain_merge_mlp(h_fused))
         return y_hat, h_u, h_v, h_w
 
     def set_neighbor_sampler(self, neighbor_sampler: NeighborSampler):

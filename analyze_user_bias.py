@@ -1,10 +1,9 @@
 """
-User bias grouping for thesis Table 10 (group-wise comparison).
+User bias grouping for thesis Table 10 (group-wise comparison) and Figure 2/3.
 
-Uses **train split only** (same split as train_tripartite_link_prediction.py) to compute
-per-user Streamer / Room HHI, then KMeans (k=3) and centroid-based labels.
-
-Output: experiment_results/user_bias_groups.csv
+Uses **train split only** to compute per-user Streamer / Room HHI, 
+then KMeans (k=3) and centroid-based labels.
+Outputs CSV and visualization plots (PDF).
 """
 
 from __future__ import annotations
@@ -16,11 +15,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 from utils.DataLoader import get_tripartite_link_prediction_data
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_OUT = ROOT / "experiment_results" / "user_bias_groups.csv"
+DEFAULT_OUT_DIR = ROOT / "experiment_results"
+DEFAULT_OUT_CSV = DEFAULT_OUT_DIR / "user_bias_groups.csv"
 
 BIAS_STREAMER = "Streamer-biased"
 BIAS_ITEM = "Item-biased"
@@ -68,10 +70,6 @@ def compute_user_hhi_from_train(train_data) -> dict[int, dict]:
 def _assign_cluster_labels(centroids: np.ndarray) -> dict[int, str]:
     """
     Map cluster_id -> bias_group using centroid comparison (k=3).
-
-    Highest mean Streamer HHI -> Streamer-biased
-    Highest mean Room HHI     -> Item-biased
-    Remaining cluster         -> Mixed
     """
     if centroids.shape != (3, 2):
         raise ValueError(f"Expected 3x2 centroids, got {centroids.shape}")
@@ -111,9 +109,56 @@ def run_clustering(
     return np.asarray(users), cluster_ids, cluster_to_label, centroids
 
 
+def plot_and_save_visualizations(df: pd.DataFrame, out_dir: Path):
+    """Generate and save academic plots for Figure 2 and Figure 3."""
+    sns.set_theme(style="whitegrid")
+    colors = {BIAS_STREAMER: "#e74c3c", BIAS_ITEM: "#3498db", BIAS_MIXED: "#2ecc71"}
+
+    # --- Plot 1: Distributions (For Figure 2 in Thesis) ---
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    
+    sns.histplot(data=df, x="streamer_hhi", kde=True, ax=axes[0], color="#95a5a6", bins=20)
+    axes[0].set_title("Streamer Concentration (HHI) Distribution", fontsize=14)
+    axes[0].set_xlabel("Streamer HHI")
+    axes[0].set_ylabel("Number of Users")
+
+    sns.histplot(data=df, x="room_hhi", kde=True, ax=axes[1], color="#9b59b6", bins=20)
+    axes[1].set_title("Item Concentration (HHI) Distribution", fontsize=14)
+    axes[1].set_xlabel("Item HHI")
+    axes[1].set_ylabel("Number of Users")
+
+    plt.tight_layout()
+    dist_path = out_dir / "fig2_user_bias_distributions.pdf"
+    plt.savefig(dist_path, format='pdf', bbox_inches='tight')
+    plt.close()
+    print(f"Saved distribution plot to: {dist_path}")
+
+    # --- Plot 2: Scatter & Clustering (For Figure 3 in Thesis) ---
+    plt.figure(figsize=(7, 6))
+    sns.scatterplot(
+        data=df, 
+        x="streamer_hhi", 
+        y="room_hhi", 
+        hue="bias_group", 
+        palette=colors,
+        s=60, 
+        alpha=0.8,
+        edgecolor="w"
+    )
+    plt.title("User Clustering based on Interaction Bias", fontsize=14, fontweight="bold")
+    plt.xlabel("Streamer Concentration (HHI)", fontsize=12)
+    plt.ylabel("Item Concentration (HHI)", fontsize=12)
+    plt.legend(title="User Bias Group", fontsize=10, title_fontsize=11)
+    
+    scatter_path = out_dir / "fig3_user_clustering_scatter.pdf"
+    plt.savefig(scatter_path, format='pdf', bbox_inches='tight')
+    plt.close()
+    print(f"Saved scatter plot to: {scatter_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Cluster users by Streamer/Room HHI on train split (Table 10 bias groups)."
+        description="Cluster users by Streamer/Room HHI and generate plots."
     )
     parser.add_argument("--dataset_name", type=str, default="kuailive_tripartite")
     parser.add_argument(
@@ -124,12 +169,6 @@ def main() -> None:
     )
     parser.add_argument("--val_ratio", type=float, default=0.15)
     parser.add_argument("--test_ratio", type=float, default=0.15)
-    parser.add_argument(
-        "--output",
-        type=str,
-        default=str(DEFAULT_OUT),
-        help="CSV path for user bias groups.",
-    )
     parser.add_argument("--random_state", type=int, default=2020, help="KMeans random seed.")
     args = parser.parse_args()
 
@@ -176,29 +215,18 @@ def main() -> None:
             }
         )
 
-    out_path = Path(args.output).expanduser().resolve()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_dir = DEFAULT_OUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save CSV
     df = pd.DataFrame(rows)
     df = df.sort_values("user_id").reset_index(drop=True)
-    df.to_csv(out_path, index=False)
-    print(f"\nWrote {len(df)} users -> {out_path}")
+    df.to_csv(DEFAULT_OUT_CSV, index=False)
+    print(f"\nWrote {len(df)} users -> {DEFAULT_OUT_CSV}")
 
-    print("\n=== KMeans centroids [Streamer_HHI, Room_HHI] ===")
-    for cid in range(3):
-        label = cluster_to_label[cid]
-        c = centroids[cid]
-        n = int((cluster_ids == cid).sum())
-        print(
-            f"  cluster {cid} ({label}): n={n}, "
-            f"centroid=({c[0]:.6f}, {c[1]:.6f})"
-        )
-
-    print("\n=== Bias group distribution ===")
-    dist = df["bias_group"].value_counts().reindex(
-        [BIAS_STREAMER, BIAS_ITEM, BIAS_MIXED], fill_value=0
-    )
-    for name, count in dist.items():
-        print(f"  {name}: {int(count)}")
+    # Generate Plots
+    print("\nGenerating academic visualizations...")
+    plot_and_save_visualizations(df, out_dir)
 
     print("\n=== Summary stats by bias_group ===")
     summary = df.groupby("bias_group")[["interaction_count", "streamer_hhi", "room_hhi"]].agg(

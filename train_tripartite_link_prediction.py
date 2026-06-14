@@ -1,7 +1,7 @@
 """
 Tripartite (User, Streamer, Room) link prediction: HTTransformer or DyGLib baselines via BaselineTripartiteWrapper.
 
-- Training: BCE with one random negative (v', w') per positive triplet.
+- Training: BCE or BPR with ``--train_neg_ratio`` random negatives (v', w') per positive (default 1).
 - Each epoch: fast validation BCE on val_data (same 1-negative protocol); early stopping minimizes val_loss.
 - After training: load best checkpoint, run full 1+99 ranking on test only (see utils.metrics).
 """
@@ -67,6 +67,26 @@ def get_tripartite_train_args():
         help="HTTransformer: homogeneous co-occurrence (one shared MLP on c_u,c_v,c_w, outputs summed).",
     )
     parser.set_defaults(use_hetero_coocc=True)
+    parser.add_argument(
+        "--train_neg_ratio",
+        type=int,
+        default=1,
+        help="Training negatives per positive triplet (1 = legacy 1:1 BCE/BPR pair).",
+    )
+    parser.add_argument(
+        "--fusion_mode",
+        type=str,
+        default="concat",
+        choices=["concat", "mean"],
+        help="HTTransformer prediction head: concat [h_u||h_v||h_w] (default) or mean (h_u+h_v+h_w)/3.",
+    )
+    parser.add_argument(
+        "--loss_type",
+        type=str,
+        default="bce",
+        choices=["bce", "bpr"],
+        help="Training loss: BCE on pos/neg scores (default) or BPR -log sigmoid(pos-neg).",
+    )
     parser.add_argument("--dataset_name", type=str, default="kuailive_tripartite")
     parser.add_argument(
         "--data_dir",
@@ -192,6 +212,8 @@ def get_tripartite_train_args():
             stacklevel=2,
         )
         args.num_depths = args.num_neighbors + 1
+    if args.train_neg_ratio < 1:
+        raise ValueError(f"train_neg_ratio must be >= 1, got {args.train_neg_ratio}")
     return args
 
 
@@ -204,30 +226,150 @@ def _type_pools(node_type_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return streamer_pool, room_pool
 
 
+def _sample_one_negative_pair(
+    v_pos: int,
+    w_pos: int,
+    streamer_pool: np.ndarray,
+    room_pool: np.ndarray,
+    rng: np.random.RandomState,
+) -> tuple[int, int]:
+    for _ in range(50):
+        vn = int(rng.choice(streamer_pool))
+        wn = int(rng.choice(room_pool))
+        if vn != v_pos or wn != w_pos:
+            return vn, wn
+    wn = int(rng.choice(room_pool))
+    if wn == w_pos:
+        wn = int(rng.choice(room_pool))
+    return v_pos, wn
+
+
 def _sample_negative_pairs(
     batch_v_pos: np.ndarray,
     batch_w_pos: np.ndarray,
     streamer_pool: np.ndarray,
     room_pool: np.ndarray,
     rng: np.random.RandomState,
+    num_negatives: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """One negative (v', w') per positive; resample until pair differs from (v_pos, w_pos)."""
+    """Sample ``num_negatives`` negative (v', w') pairs per positive row."""
+    if num_negatives < 1:
+        raise ValueError(f"num_negatives must be >= 1, got {num_negatives}")
     b = len(batch_v_pos)
-    v_neg = np.empty(b, dtype=np.int64)
-    w_neg = np.empty(b, dtype=np.int64)
+    if num_negatives == 1:
+        v_neg = np.empty(b, dtype=np.int64)
+        w_neg = np.empty(b, dtype=np.int64)
+        for i in range(b):
+            v_neg[i], w_neg[i] = _sample_one_negative_pair(
+                int(batch_v_pos[i]), int(batch_w_pos[i]), streamer_pool, room_pool, rng
+            )
+        return v_neg, w_neg
+
+    v_neg = np.empty((b, num_negatives), dtype=np.int64)
+    w_neg = np.empty((b, num_negatives), dtype=np.int64)
     for i in range(b):
         vp, wp = int(batch_v_pos[i]), int(batch_w_pos[i])
-        for _ in range(50):
-            vn = int(rng.choice(streamer_pool))
-            wn = int(rng.choice(room_pool))
-            if vn != vp or wn != wp:
-                v_neg[i] = vn
-                w_neg[i] = wn
-                break
-        else:
-            v_neg[i] = vp
-            w_neg[i] = wn if wp != wn else int(rng.choice(room_pool))
+        for j in range(num_negatives):
+            v_neg[i, j], w_neg[i, j] = _sample_one_negative_pair(vp, wp, streamer_pool, room_pool, rng)
     return v_neg, w_neg
+
+
+def _forward_pos_neg_scores(
+    model: nn.Module,
+    bu: np.ndarray,
+    bv: np.ndarray,
+    bw: np.ndarray,
+    bt: np.ndarray,
+    bv_neg: np.ndarray,
+    bw_neg: np.ndarray,
+    batch_edge_ids: np.ndarray,
+    *,
+    tgn: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns y_pos [batch_size] and y_neg [batch_size, num_negatives].
+    """
+    if bv_neg.ndim == 1:
+        num_neg = 1
+        bv_neg_flat = bv_neg
+        bw_neg_flat = bw_neg
+    else:
+        num_neg = bv_neg.shape[1]
+        batch_size = len(bu)
+        bv_neg_flat = bv_neg.reshape(-1)
+        bw_neg_flat = bw_neg.reshape(-1)
+        bu_neg = np.repeat(bu, num_neg)
+        bt_neg = np.repeat(bt, num_neg)
+    if tgn:
+        if num_neg == 1:
+            y_neg, _, _, _ = model(bu, bv_neg_flat, bw_neg_flat, bt, edge_ids=None, edges_are_positive=False)
+            y_pos, _, _, _ = model(
+                bu, bv, bw, bt, edge_ids=batch_edge_ids, edges_are_positive=True
+            )
+            return y_pos.view(-1), y_neg.view(-1).unsqueeze(1)
+        y_pos, _, _, _ = model(bu, bv, bw, bt, edge_ids=batch_edge_ids, edges_are_positive=True)
+        y_neg, _, _, _ = model(
+            bu_neg, bv_neg_flat, bw_neg_flat, bt_neg, edge_ids=None, edges_are_positive=False
+        )
+        return y_pos.view(-1), y_neg.view(-1).reshape(len(bu), num_neg)
+
+    y_pos, _, _, _ = model(bu, bv, bw, bt, edge_ids=batch_edge_ids, edges_are_positive=True)
+    if num_neg == 1:
+        y_neg, _, _, _ = model(bu, bv_neg_flat, bw_neg_flat, bt, edge_ids=None, edges_are_positive=False)
+        return y_pos.view(-1), y_neg.view(-1).unsqueeze(1)
+    y_neg, _, _, _ = model(
+        bu_neg, bv_neg_flat, bw_neg_flat, bt_neg, edge_ids=None, edges_are_positive=False
+    )
+    return y_pos.view(-1), y_neg.view(-1).reshape(len(bu), num_neg)
+
+
+def _compute_tripartite_training_loss(
+    y_pos: torch.Tensor,
+    y_neg: torch.Tensor,
+    *,
+    loss_type: str,
+    loss_fn: nn.Module | None,
+    device: str,
+) -> torch.Tensor:
+    """y_pos [B]; y_neg [B, K]. BCE or BPR over all pos–neg pairs in the batch."""
+    y_pos = y_pos.view(-1)
+    if y_neg.dim() == 1:
+        y_neg = y_neg.unsqueeze(1)
+
+    if loss_type == "bce":
+        if loss_fn is None:
+            raise ValueError("BCE training requires loss_fn (nn.BCELoss).")
+        predicts = torch.cat([y_pos, y_neg.reshape(-1)], dim=0)
+        labels = torch.cat(
+            [
+                torch.ones_like(y_pos, device=device, dtype=torch.float32),
+                torch.zeros(y_neg.numel(), device=device, dtype=torch.float32),
+            ],
+            dim=0,
+        )
+        return loss_fn(predicts.float(), labels)
+
+    if loss_type == "bpr":
+        diff = y_pos.unsqueeze(1) - y_neg
+        return (-torch.log(torch.sigmoid(diff) + 1e-10)).mean()
+
+    raise ValueError(f"Unknown loss_type: {loss_type}")
+
+
+def _training_metric_tensors(y_pos: torch.Tensor, y_neg: torch.Tensor, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flatten pos/neg scores and binary labels for diagnostic AUC/AP during training."""
+    y_pos = y_pos.view(-1)
+    if y_neg.dim() == 1:
+        y_neg = y_neg.unsqueeze(1)
+    predicts = torch.cat([y_pos, y_neg.reshape(-1)], dim=0)
+    labels = torch.cat(
+        [
+            torch.ones_like(y_pos, device=device, dtype=torch.float32),
+            torch.zeros(y_neg.numel(), device=device, dtype=torch.float32),
+        ],
+        dim=0,
+    )
+    return predicts, labels
 
 
 def _is_tgn_model(model: nn.Module) -> bool:
@@ -389,10 +531,12 @@ def train_one_epoch(
     train_data: TripartiteData,
     train_loader,
     optimizer: torch.optim.Optimizer,
-    loss_fn: nn.Module,
+    loss_fn: nn.Module | None,
     node_type_ids: np.ndarray,
     device: str,
     train_rng: np.random.RandomState,
+    train_neg_ratio: int = 1,
+    loss_type: str = "bce",
 ) -> tuple[float, dict]:
     model.train()
     model.set_neighbor_sampler(neighbor_sampler)
@@ -411,35 +555,16 @@ def train_one_epoch(
         bw = train_data.item_node_ids[idx]
         bt = train_data.node_interact_times[idx]
 
-        bv_neg, bw_neg = _sample_negative_pairs(bv, bw, streamer_pool, room_pool, train_rng)
-
-        batch_edge_ids = train_data.edge_ids[idx]
-        if tgn:
-            y_neg, _, _, _ = model(
-                bu, bv_neg, bw_neg, bt, edge_ids=None, edges_are_positive=False
-            )
-            y_pos, _, _, _ = model(
-                bu, bv, bw, bt, edge_ids=batch_edge_ids, edges_are_positive=True
-            )
-        else:
-            y_pos, _, _, _ = model(
-                bu, bv, bw, bt, edge_ids=batch_edge_ids, edges_are_positive=True
-            )
-            y_neg, _, _, _ = model(
-                bu, bv_neg, bw_neg, bt, edge_ids=None, edges_are_positive=False
-            )
-
-        y_pos = y_pos.view(-1)
-        y_neg = y_neg.view(-1)
-        predicts = torch.cat([y_pos, y_neg], dim=0)
-        labels = torch.cat(
-            [
-                torch.ones_like(y_pos, device=device, dtype=torch.float32),
-                torch.zeros_like(y_neg, device=device, dtype=torch.float32),
-            ],
-            dim=0,
+        bv_neg, bw_neg = _sample_negative_pairs(
+            bv, bw, streamer_pool, room_pool, train_rng, num_negatives=train_neg_ratio
         )
-        loss = loss_fn(predicts.float(), labels)
+        batch_edge_ids = train_data.edge_ids[idx]
+        y_pos, y_neg = _forward_pos_neg_scores(
+            model, bu, bv, bw, bt, bv_neg, bw_neg, batch_edge_ids, tgn=tgn
+        )
+        loss = _compute_tripartite_training_loss(
+            y_pos, y_neg, loss_type=loss_type, loss_fn=loss_fn, device=device
+        )
 
         optimizer.zero_grad()
         loss.backward()
@@ -449,6 +574,7 @@ def train_one_epoch(
 
         losses.append(loss.item())
         with torch.no_grad():
+            predicts, labels = _training_metric_tensors(y_pos, y_neg, device)
             batch_metrics.append(get_link_prediction_metrics(predicts=predicts, labels=labels))
 
     train_metrics_mean = {k: float(np.mean([m[k] for m in batch_metrics])) for k in batch_metrics[0]}
@@ -598,7 +724,24 @@ def main():
     for run in range(args.num_runs):
         set_random_seed(seed=run)
         args.seed = run
-        args.save_model_name = f"{args.model_name}_seed{args.seed}"
+        # === 動態命名修復：根據消融參數自動調整儲存檔名 ===
+        suffix = ""
+        if args.model_name == "HTTransformer":
+            if not args.use_bias_gate:
+                suffix += "_no_bias_gate"
+            if not args.use_type_init:
+                suffix += "_no_type_init"
+            if not args.use_hetero_coocc:
+                suffix += "_no_hetero_coocc"
+            if args.fusion_mode != "concat":
+                suffix += f"_{args.fusion_mode}"
+            if args.loss_type != "bce":
+                suffix += f"_{args.loss_type}"
+            if args.train_neg_ratio != 1:
+                suffix += f"_neg{args.train_neg_ratio}"
+
+        args.save_model_name = f"{args.model_name}{suffix}_seed{args.seed}"
+        # =================================================
 
         logging.basicConfig(level=logging.INFO)
         logger = logging.getLogger()
@@ -686,6 +829,7 @@ def main():
                 use_bias_gate=args.use_bias_gate,
                 use_type_init=args.use_type_init,
                 use_hetero_coocc=args.use_hetero_coocc,
+                fusion_mode=args.fusion_mode,
             )
         elif args.model_name in TRIPARTITE_BASELINE_MODELS:
             model = BaselineTripartiteWrapper(
@@ -722,7 +866,15 @@ def main():
             weight_decay=args.weight_decay,
         )
         model = convert_to_gpu(model, device=args.device)
-        loss_fn = nn.BCELoss()
+        train_loss_fn = nn.BCELoss() if args.loss_type == "bce" else None
+        val_loss_fn = nn.BCELoss()
+
+        if args.model_name != "HTTransformer" and args.fusion_mode != "concat":
+            logger.warning(
+                "fusion_mode=%s applies only to HTTransformer; ignored for %s.",
+                args.fusion_mode,
+                args.model_name,
+            )
 
         save_model_folder = f"./saved_models/{args.model_name}/{args.dataset_name}/{args.save_model_name}/"
         shutil.rmtree(save_model_folder, ignore_errors=True)
@@ -752,10 +904,12 @@ def main():
                 train_data=train_data,
                 train_loader=train_loader,
                 optimizer=optimizer,
-                loss_fn=loss_fn,
+                loss_fn=train_loss_fn,
                 node_type_ids=node_type_ids,
                 device=args.device,
                 train_rng=train_rng,
+                train_neg_ratio=args.train_neg_ratio,
+                loss_type=args.loss_type,
             )
 
             train_mem_backup = None
@@ -767,7 +921,7 @@ def main():
                 neighbor_sampler=train_neighbor_sampler,
                 val_data=val_data,
                 val_loader=val_loader,
-                loss_fn=loss_fn,
+                loss_fn=val_loss_fn,
                 node_type_ids=node_type_ids,
                 device=args.device,
                 val_rng=val_loss_rng,
@@ -876,10 +1030,14 @@ def main():
             summary["use_bias_gate"] = args.use_bias_gate
             summary["use_type_init"] = args.use_type_init
             summary["use_hetero_coocc"] = args.use_hetero_coocc
+            summary["fusion_mode"] = args.fusion_mode
         else:
             summary["use_bias_gate"] = None
             summary["use_type_init"] = None
             summary["use_hetero_coocc"] = None
+            summary["fusion_mode"] = None
+        summary["train_neg_ratio"] = args.train_neg_ratio
+        summary["loss_type"] = args.loss_type
         for k, v in test_mean.items():
             summary[f"test_{k}"] = _json_scalar(v)
         os.makedirs(os.path.dirname(os.path.abspath(args.metrics_out)) or ".", exist_ok=True)
