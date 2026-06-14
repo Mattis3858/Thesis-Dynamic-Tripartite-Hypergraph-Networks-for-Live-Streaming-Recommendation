@@ -152,9 +152,16 @@ def get_eval_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.1)
     
     # [RESTORED] Back to 99 negatives
-    parser.add_argument("--num_ranking_negatives", type=int, default=99) 
-    
+    parser.add_argument("--num_ranking_negatives", type=int, default=99)
+
     parser.add_argument("--eval_seed", type=int, default=0)
+    parser.add_argument(
+        "--eval_candidates_path",
+        type=str,
+        default=None,
+        help="If set, rank against this shared fixed candidate .npz (new protocol). "
+        "Default None = legacy on-the-fly uniform sampling.",
+    )
     parser.add_argument(
         "--full_model_dir",
         type=str,
@@ -277,6 +284,12 @@ def main() -> None:
             "Checkpoint was trained with use_bias_gate=False; Table 13 masking still uses loaded head."
         )
 
+    eval_candidates = None
+    if args.eval_candidates_path:
+        from utils.eval_candidates import load_eval_candidates
+
+        eval_candidates = load_eval_candidates(args.eval_candidates_path)
+
     results: dict[str, dict[str, float]] = {}
 
     for setting_name, mask_v, mask_w in EVAL_SETTINGS:
@@ -293,6 +306,7 @@ def main() -> None:
                 num_negatives=args.num_ranking_negatives,
                 eval_rng=test_eval_rng,
                 return_per_query=False,
+                eval_candidates=eval_candidates,
             )
         results[setting_name] = agg
         print(

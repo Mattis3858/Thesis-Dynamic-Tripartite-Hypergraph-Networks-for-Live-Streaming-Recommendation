@@ -122,3 +122,6 @@ reference_models
 kuailive_data
 
 experiment_results
+
+# generated fixed ranking-candidate sets (rebuilt from data + seed via build_eval_candidates.py)
+eval_candidates/

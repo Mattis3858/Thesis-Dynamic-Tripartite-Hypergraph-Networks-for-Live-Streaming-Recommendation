@@ -25,7 +25,18 @@ from models.BaselineTripartiteWrapper import BaselineTripartiteWrapper, TRIPARTI
 from models.HTTransformer import HTTransformer
 from utils.DataLoader import TripartiteData, get_idx_data_loader, get_tripartite_link_prediction_data
 from utils.EarlyStopping import EarlyStopping
-from utils.metrics import get_link_prediction_metrics, mean_metric_dicts, tripartite_ranking_metrics_per_query
+from utils.metrics import (
+    TRIPARTITE_RANKING_KS,
+    get_link_prediction_metrics,
+    mean_metric_dicts,
+    tripartite_ranking_metrics_per_query,
+)
+from utils.eval_candidates import (
+    EvalCandidateConfig,
+    build_eval_candidates,
+    load_eval_candidates,
+    save_eval_candidates,
+)
 from utils.utils import convert_to_gpu, create_optimizer, get_neighbor_sampler, get_parameter_sizes, set_random_seed
 from utils.utils import get_tripartite_neighbor_sampler
 
@@ -133,6 +144,69 @@ def get_tripartite_train_args():
     )
     parser.add_argument("--num_ranking_negatives", type=int, default=99, help="99 negatives + 1 positive = 100 candidates")
     parser.add_argument("--eval_seed", type=int, default=0, help="seed for ranking negative sampling in val/test")
+
+    # --- fixed, shared test-candidate set (new evaluation protocol; see utils.eval_candidates) ---
+    g_fc = parser.add_mutually_exclusive_group()
+    g_fc.add_argument(
+        "--use_fixed_eval_candidates",
+        dest="use_fixed_eval_candidates",
+        action="store_true",
+        help="Test ranking against a pre-generated, model-independent candidate set (default on). "
+        "This is the fair, harder protocol; all models read the same negatives.",
+    )
+    g_fc.add_argument(
+        "--no-use_fixed_eval_candidates",
+        dest="use_fixed_eval_candidates",
+        action="store_false",
+        help="Legacy protocol: sample uniform negatives on the fly at scoring time (for old-vs-new comparison).",
+    )
+    parser.set_defaults(use_fixed_eval_candidates=True)
+    parser.add_argument(
+        "--eval_candidates_path",
+        type=str,
+        default=None,
+        help="Path to the candidate .npz. Default: eval_candidates/{dataset}_test_{setting}_seed{S}.npz. "
+        "Built once if missing, then reused (all models/ablations must point at the same file).",
+    )
+    parser.add_argument("--neg_ratio_popularity", type=float, default=0.5, help="Fraction of negatives from popularity-as-of-t.")
+    parser.add_argument("--neg_ratio_hard", type=float, default=0.3, help="Fraction from user-history hard negatives.")
+    parser.add_argument("--neg_ratio_uniform", type=float, default=0.2, help="Fraction from uniform sampling.")
+    parser.add_argument(
+        "--neg_popularity_window",
+        type=float,
+        default=None,
+        help="Popularity time window ending at t (dataset ts units). Default: all history before t. "
+        "TODO(GPU): tune a finite window on full data.",
+    )
+    parser.add_argument(
+        "--neg_candidate_universe",
+        type=str,
+        default="observed",
+        choices=["observed", "product"],
+        help="'observed' = only (streamer,room) combos that occur in data (harder/realistic); "
+        "'product' = full streamer x room grid (legacy-style).",
+    )
+    parser.add_argument(
+        "--neg_sampling_seed",
+        type=int,
+        default=None,
+        help="Seed for candidate generation. Default: eval_seed + 1 (matches the legacy test-negative seed).",
+    )
+    parser.add_argument(
+        "--enable_user_item_setting",
+        action="store_true",
+        help="Also build the user-item (replace-room-only) candidate set. Off by default: with a tiny "
+        "room pool it cannot form distinct negatives and its numbers duplicate the main setting.",
+    )
+    parser.add_argument(
+        "--early_stop_metric",
+        type=str,
+        default="val_loss",
+        choices=["val_loss", "val_ndcg@5", "val_ndcg@10", "val_recall@10"],
+        help="Model-selection metric. Default 'val_loss' (1-neg BCE, current behaviour). The ranking "
+        "options monitor validation under the fixed-candidate protocol -- interface for the next "
+        "phase (using it for the thesis means RE-TRAINING all models; not done this round).",
+    )
     parser.add_argument(
         "--time_gap",
         type=int,
@@ -214,7 +288,21 @@ def get_tripartite_train_args():
         args.num_depths = args.num_neighbors + 1
     if args.train_neg_ratio < 1:
         raise ValueError(f"train_neg_ratio must be >= 1, got {args.train_neg_ratio}")
+    if args.neg_sampling_seed is None:
+        args.neg_sampling_seed = args.eval_seed + 1
     return args
+
+
+def _file_sha256(path: str) -> str:
+    """First 16 hex chars of a file's sha256 -- logged so two model runs can be confirmed to read
+    the same candidate file."""
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
 
 
 def _type_pools(node_type_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -436,6 +524,99 @@ def evaluate_tripartite_cold_start_by_split(
     return out
 
 
+def _empty_ranking_metrics() -> dict:
+    """NaN-filled metric dict (same keys as a real one) for queries with < 2 candidates."""
+    d: dict[str, float] = {"roc_auc": float("nan"), "average_precision": float("nan")}
+    for k in TRIPARTITE_RANKING_KS:
+        d[f"recall@{k}"] = float("nan")
+        d[f"precision@{k}"] = float("nan")
+        d[f"ndcg@{k}"] = float("nan")
+    return d
+
+
+@torch.no_grad()
+def _rank_from_fixed_candidates(
+    model: nn.Module,
+    data: TripartiteData,
+    idx_data_loader,
+    eval_candidates,
+    device: str,
+    return_per_query: bool,
+) -> tuple[float, dict] | tuple[float, dict, list[dict]]:
+    """
+    Score the pre-generated, model-independent candidate set (see utils.eval_candidates).
+
+    Per query: candidate 0 is the positive (v_pos, w_pos), candidates 1.. are the stored
+    negatives (variable count per query -- a small dev subset may not fill N). All candidates of
+    a batch are flattened into one forward call, then split back per query for ranking metrics.
+    Loader order must be sequential so per-query metrics align with data rows (cold-start /
+    group-wise subsetting relies on this).
+    """
+    loss_fn = nn.BCELoss()
+    neg_v, neg_w, neg_count = eval_candidates.neg_v, eval_candidates.neg_w, eval_candidates.neg_count
+
+    all_query_metrics: list[dict] = []
+    bce_losses: list[float] = []
+
+    for batch_indices in tqdm(idx_data_loader, ncols=120, desc="eval ranking (fixed cand)"):
+        idx = batch_indices.numpy()
+        flat_u: list[int] = []
+        flat_v: list[int] = []
+        flat_w: list[int] = []
+        flat_t: list[float] = []
+        lengths: list[int] = []
+        for i in idx:
+            i = int(i)
+            m = int(neg_count[i])
+            cv = [int(data.streamer_node_ids[i])] + neg_v[i, :m].tolist()
+            cw = [int(data.item_node_ids[i])] + neg_w[i, :m].tolist()
+            L = len(cv)
+            flat_u.extend([int(data.user_node_ids[i])] * L)
+            flat_t.extend([float(data.node_interact_times[i])] * L)
+            flat_v.extend(cv)
+            flat_w.extend(cw)
+            lengths.append(L)
+
+        y_hat, _, _, _ = model(
+            np.asarray(flat_u, dtype=np.int64),
+            np.asarray(flat_v, dtype=np.int64),
+            np.asarray(flat_w, dtype=np.int64),
+            np.asarray(flat_t, dtype=np.float64),
+            edge_ids=None,
+            edges_are_positive=False,
+        )
+        y_hat = y_hat.view(-1).float().cpu().numpy()
+
+        offset = 0
+        batch_pos: list[float] = []
+        batch_neg: list[float] = []
+        for L in lengths:
+            s = y_hat[offset : offset + L]
+            offset += L
+            if L >= 2:
+                all_query_metrics.append(tripartite_ranking_metrics_per_query(s, positive_index=0))
+            else:
+                all_query_metrics.append(_empty_ranking_metrics())
+            batch_pos.append(float(s[0]))
+            if L > 1:
+                batch_neg.extend(s[1:].tolist())
+
+        if batch_pos:
+            pos_scores = torch.tensor(batch_pos, dtype=torch.float32, device=device)
+            neg_scores = torch.tensor(batch_neg if batch_neg else [0.0], dtype=torch.float32, device=device)
+            bce = loss_fn(
+                torch.cat([pos_scores, neg_scores], dim=0),
+                torch.cat([torch.ones_like(pos_scores), torch.zeros_like(neg_scores)], dim=0),
+            )
+            bce_losses.append(float(bce.item()))
+
+    mean_bce = float(np.mean(bce_losses)) if bce_losses else float("nan")
+    agg = mean_metric_dicts(all_query_metrics)
+    if return_per_query:
+        return mean_bce, agg, all_query_metrics
+    return mean_bce, agg
+
+
 @torch.no_grad()
 def evaluate_tripartite_ranking(
     model: nn.Module,
@@ -447,14 +628,25 @@ def evaluate_tripartite_ranking(
     num_negatives: int,
     eval_rng: np.random.RandomState,
     return_per_query: bool = False,
+    eval_candidates=None,
 ) -> tuple[float, dict] | tuple[float, dict, list[dict]]:
     """
-    For each query triplet, build 1 positive + num_negatives negatives (random v,w), score all, rank.
-    Returns mean BCE on pos/neg pairs (diagnostic) and aggregated ranking metrics.
-    If return_per_query, also returns metrics per test row (loader order must match sequential indices).
+    Rank 1 positive against negatives per query; return diagnostic BCE + aggregated ranking metrics.
+
+    Two modes:
+      * ``eval_candidates`` given (new protocol): score the fixed, model-independent candidate set
+        -- ``num_negatives`` / ``eval_rng`` are ignored. This is what makes cross-model comparison
+        fair (every model reads the same negatives). See utils.eval_candidates.
+      * ``eval_candidates is None`` (legacy protocol): sample ``num_negatives`` uniform (v', w')
+        on the fly with ``eval_rng``. Kept for the old-vs-new comparison.
+
+    If return_per_query, also returns metrics per row (loader order must match sequential indices).
     """
     model.eval()
     model.set_neighbor_sampler(neighbor_sampler)
+
+    if eval_candidates is not None:
+        return _rank_from_fixed_candidates(model, data, idx_data_loader, eval_candidates, device, return_per_query)
 
     streamer_pool, room_pool = _type_pools(node_type_ids)
     loss_fn = nn.BCELoss()
@@ -718,6 +910,84 @@ def main():
         shuffle=False,
     )
 
+    # --- build (or load) the fixed, model-independent test candidate set ONCE ---
+    # It depends only on (data, config, seed), never on any model, so every run / model / ablation
+    # that points at the same file ranks against byte-identical negatives.
+    test_candidates = None
+    test_candidates_path = None
+    if args.use_fixed_eval_candidates:
+        if args.eval_candidates_path is not None:
+            test_candidates_path = args.eval_candidates_path
+        else:
+            test_candidates_path = (
+                f"./eval_candidates/{args.dataset_name}_test_joint_vw_seed{args.neg_sampling_seed}.npz"
+            )
+        cand_cfg = EvalCandidateConfig(
+            num_negatives=args.num_ranking_negatives,
+            ratio_popularity=args.neg_ratio_popularity,
+            ratio_hard=args.neg_ratio_hard,
+            ratio_uniform=args.neg_ratio_uniform,
+            popularity_window=args.neg_popularity_window,
+            candidate_universe=args.neg_candidate_universe,
+            setting="joint_vw",
+            seed=args.neg_sampling_seed,
+        )
+        if os.path.exists(test_candidates_path):
+            test_candidates = load_eval_candidates(test_candidates_path)
+            logging.info("Loaded fixed eval candidates from %s", test_candidates_path)
+        else:
+            test_candidates = build_eval_candidates(
+                test_data, full_data, node_type_ids, cand_cfg, train_data=train_data
+            )
+            save_eval_candidates(test_candidates_path, test_candidates)
+            logging.info("Built and saved fixed eval candidates to %s", test_candidates_path)
+        logging.info(
+            "Fixed eval candidates sha256=%s | %s",
+            _file_sha256(test_candidates_path),
+            test_candidates.summary(),
+        )
+        if args.enable_user_item_setting:
+            ui_cfg = EvalCandidateConfig(
+                num_negatives=args.num_ranking_negatives, candidate_universe=args.neg_candidate_universe,
+                setting="item_only", seed=args.neg_sampling_seed,
+            )
+            ui_path = f"./eval_candidates/{args.dataset_name}_test_item_only_seed{args.neg_sampling_seed}.npz"
+            if not os.path.exists(ui_path):
+                save_eval_candidates(
+                    ui_path,
+                    build_eval_candidates(test_data, full_data, node_type_ids, ui_cfg, train_data=train_data),
+                )
+            logging.info("Built user-item (item_only) candidates at %s (setting is opt-in).", ui_path)
+    else:
+        logging.warning(
+            "Legacy eval protocol: sampling uniform test negatives on the fly (eval_seed+1=%s). "
+            "Use --use_fixed_eval_candidates for the fair/harder shared protocol.",
+            args.eval_seed + 1,
+        )
+
+    # Ranking-based validation monitoring (interface for the next phase; default off). Building the
+    # val candidate set is cheap and model-independent, so we do it once here when selected.
+    val_candidates = None
+    if args.early_stop_metric != "val_loss":
+        val_cfg = EvalCandidateConfig(
+            num_negatives=args.num_ranking_negatives,
+            ratio_popularity=args.neg_ratio_popularity,
+            ratio_hard=args.neg_ratio_hard,
+            ratio_uniform=args.neg_ratio_uniform,
+            popularity_window=args.neg_popularity_window,
+            candidate_universe=args.neg_candidate_universe,
+            setting="joint_vw",
+            seed=args.neg_sampling_seed,
+        )
+        val_candidates = build_eval_candidates(
+            val_data, full_data, node_type_ids, val_cfg, train_data=train_data
+        )
+        logging.warning(
+            "early_stop_metric=%s selects checkpoints by VALIDATION RANKING, not BCE. This changes "
+            "model selection -- re-train all models before reporting; not part of this round.",
+            args.early_stop_metric,
+        )
+
     best_val_loss_all_runs: list[float] = []
     test_metric_all_runs: list[dict] = []
 
@@ -927,6 +1197,22 @@ def main():
                 val_rng=val_loss_rng,
             )
 
+            # ranking-based validation monitoring (interface; default path is val_loss only)
+            val_monitor_value = None
+            if val_candidates is not None:
+                _vl, val_rank_agg = evaluate_tripartite_ranking(
+                    model=model,
+                    neighbor_sampler=train_neighbor_sampler,
+                    data=val_data,
+                    idx_data_loader=val_loader,
+                    node_type_ids=node_type_ids,
+                    device=args.device,
+                    num_negatives=args.num_ranking_negatives,
+                    eval_rng=val_loss_rng,
+                    eval_candidates=val_candidates,
+                )
+                val_monitor_value = val_rank_agg.get(args.early_stop_metric.replace("val_", ""))
+
             if args.model_name == "TGN" and train_mem_backup is not None:
                 model.reload_memory_bank(train_mem_backup)
 
@@ -939,8 +1225,13 @@ def main():
             for mk, mv in train_metrics.items():
                 logger.info("train %s %.4f", mk, mv)
 
-            if early_stopping.step([("val_loss", val_loss, False)], model):
-                logger.info("Early stopping at epoch %s (best val_loss %.4f).", epoch + 1, early_stopping.best_metrics.get("val_loss"))
+            if args.early_stop_metric == "val_loss":
+                stop = early_stopping.step([("val_loss", val_loss, False)], model)
+            else:
+                logger.info("Epoch %s | %s %.4f", epoch + 1, args.early_stop_metric, val_monitor_value)
+                stop = early_stopping.step([(args.early_stop_metric, val_monitor_value, True)], model)
+            if stop:
+                logger.info("Early stopping at epoch %s (best %s).", epoch + 1, args.early_stop_metric)
                 break
 
         early_stopping.load_checkpoint(model)
@@ -958,6 +1249,7 @@ def main():
             num_negatives=args.num_ranking_negatives,
             eval_rng=test_eval_rng,
             return_per_query=True,
+            eval_candidates=test_candidates,
         )
         test_cold_start_metrics = evaluate_tripartite_cold_start_by_split(
             train_data, test_data, test_per_query_metrics

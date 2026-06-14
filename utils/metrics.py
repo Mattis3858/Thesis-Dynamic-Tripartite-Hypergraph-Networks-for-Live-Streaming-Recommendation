@@ -8,8 +8,11 @@ import numpy as np
 import torch
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-# 1 ground-truth + 99 negatives => 100 candidates; K must be <= num_candidates for meaningful @K
-TRIPARTITE_RANKING_KS: tuple[int, ...] = (5, 10, 20, 50, 100)
+# 1 ground-truth + 99 negatives => 100 candidates; K must be <= num_candidates for meaningful @K.
+# K=1,3 added so the strict top-K metrics the thesis tables report (P@1, N@3) are actually
+# computed (eval_table10.py reads precision@1 / ndcg@3). If you change this set, regenerate the
+# results_*.csv files from scratch -- run_experiments.py mirrors this tuple to build CSV columns.
+TRIPARTITE_RANKING_KS: tuple[int, ...] = (1, 3, 5, 10, 20, 50, 100)
 
 
 def get_link_prediction_metrics(predicts: torch.Tensor, labels: torch.Tensor):
@@ -57,6 +60,16 @@ def tripartite_ranking_metrics_per_query(
     Returns ROC-AUC, Average Precision (AP), and for each K in ``ks``:
     Precision@K, Recall@K, NDCG@K (single-item IDCG = 1/log2(2)).
 
+    Tie handling: HR/Precision/NDCG are the **expected values under a uniform random
+    tie-break** -- the positive is equally likely to occupy any of the ``num_tied`` positions
+    its score-block spans. This is the analytic equivalent of shuffling tied candidates with a
+    random seed (but with no seed variance), and is identical to plain integer-rank metrics
+    when there are no ties (the usual case for a continuous model). The old ``argsort`` rank
+    always placed the positive (at index 0) ahead of equal-scored candidates, so a model
+    emitting constant scores scored HR/NDCG = 1.0 while its AUC was 0.5 (e.g. degenerate HAN
+    outputs). Under this fix a constant-score model reads as exactly random: AUC = 0.5 and
+    HR@K = K / num_candidates, consistent with AP.
+
     :param scores: shape (num_candidates,)
     :param positive_index: index of the ground-truth among candidates (default 0)
     :param ks: K values for @K metrics; default ``TRIPARTITE_RANKING_KS``
@@ -69,8 +82,11 @@ def tripartite_ranking_metrics_per_query(
     if num_cand < 2:
         raise ValueError("Need at least 2 candidates for ranking metrics.")
 
-    order = np.argsort(-scores)
-    rank = int(np.where(order == positive_index)[0][0])
+    pos_score = scores[positive_index]
+    num_strictly_better = int(np.sum(scores > pos_score))
+    num_tied = int(np.sum(scores == pos_score))  # includes the positive itself, so >= 1
+    # expected 0-indexed rank (diagnostic): ties share the middle of the block they occupy
+    rank = num_strictly_better + (num_tied - 1) / 2.0
 
     labels = np.zeros(num_cand, dtype=np.int64)
     labels[positive_index] = 1
@@ -86,15 +102,26 @@ def tripartite_ranking_metrics_per_query(
 
     metrics: dict[str, float] = {"roc_auc": roc, "average_precision": ap}
 
-    idcg1 = 1.0 / np.log2(2.0)
+    idcg1 = 1.0 / np.log2(2.0)  # single relevant item
 
+    # Expected metrics under a uniform random tie-break: the positive is equally likely to
+    # occupy any 0-indexed position in [lo, hi). With no ties (num_tied == 1) this collapses
+    # to the usual integer-rank metrics.
+    lo = num_strictly_better
+    hi = num_strictly_better + num_tied  # exclusive
     for k in ks:
         if k <= 0:
             raise ValueError(f"K must be positive, got {k}")
-        metrics[f"recall@{k}"] = 1.0 if rank < k else 0.0
-        metrics[f"precision@{k}"] = (1.0 / k) if rank < k else 0.0
-        if rank < k:
-            dcg_k = 1.0 / np.log2(rank + 2.0)
+        # fraction of the tie block that falls within top-k = P(positive in top-k)
+        in_topk = max(0, min(hi, k) - lo)
+        hit = in_topk / num_tied
+        metrics[f"recall@{k}"] = float(hit)
+        metrics[f"precision@{k}"] = float(hit / k)
+        # expected NDCG: average DCG over the tie-block positions that land within top-k
+        p_end = min(hi, k)  # exclusive
+        if p_end > lo:
+            positions = np.arange(lo, p_end)
+            dcg_k = float(np.sum(1.0 / np.log2(positions + 2.0)) / num_tied)
         else:
             dcg_k = 0.0
         metrics[f"ndcg@{k}"] = float(dcg_k / idcg1) if idcg1 > 0 else 0.0

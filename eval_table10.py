@@ -261,6 +261,13 @@ def get_eval_args() -> argparse.Namespace:
     # [RESTORED] Back to 99 negatives
     parser.add_argument("--num_ranking_negatives", type=int, default=99)
     parser.add_argument("--eval_seed", type=int, default=0)
+    parser.add_argument(
+        "--eval_candidates_path",
+        type=str,
+        default=None,
+        help="If set, rank against this shared fixed candidate .npz (new protocol; both models read "
+        "the same negatives). Default None = legacy on-the-fly uniform sampling.",
+    )
     parser.add_argument("--run_seed", type=int, default=0)
     parser.add_argument("--full_model_dir", type=str, default=str(DEFAULT_FULL_DIR))
     parser.add_argument("--full_save_model_name", type=str, default=None)
@@ -334,6 +341,13 @@ def main() -> None:
         num_heads=args.num_heads, dropout=args.dropout, max_input_sequence_length=args.max_input_sequence_length,
     )
 
+    eval_candidates = None
+    if args.eval_candidates_path:
+        from utils.eval_candidates import load_eval_candidates
+
+        eval_candidates = load_eval_candidates(args.eval_candidates_path)
+        logger.info("Using shared fixed eval candidates from %s", args.eval_candidates_path)
+
     results: dict[str, dict[str, dict[str, float]]] = {}
     query_counts: dict[str, dict[str, int]] = {MODEL_FULL: {}, MODEL_WO_GATE: {}}
 
@@ -349,7 +363,7 @@ def main() -> None:
         _loss, _agg, per_query = evaluate_tripartite_ranking(
             model=model, neighbor_sampler=full_neighbor_sampler, data=test_data, idx_data_loader=test_loader,
             node_type_ids=node_type_ids, device=device, num_negatives=args.num_ranking_negatives,
-            eval_rng=test_eval_rng, return_per_query=True,
+            eval_rng=test_eval_rng, return_per_query=True, eval_candidates=eval_candidates,
         )
         
         by_group = aggregate_metrics_by_bias_group(test_data, per_query, user_group_map)

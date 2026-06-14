@@ -31,7 +31,9 @@ ROOT = Path(__file__).resolve().parent
 TRAIN = ROOT / "train_tripartite_link_prediction.py"
 
 # Must match utils.metrics.TRIPARTITE_RANKING_KS
-TRIPARTITE_RANKING_KS = (5, 10, 20, 50, 100)
+# NOTE: 1 and 3 were added (P@1 / N@3 for the thesis tables). Changing this set changes the
+# CSV columns -- start fresh results_*.csv files rather than appending to old ones.
+TRIPARTITE_RANKING_KS = (1, 3, 5, 10, 20, 50, 100)
 
 OVERALL_MODELS = [
     "HTTransformer",
@@ -78,7 +80,7 @@ def _ranking_metric_columns(prefix: str) -> list[str]:
 CSV_COLUMNS = _CSV_META_COLUMNS + _ranking_metric_columns("test_") + _ranking_metric_columns("val_")
 
 
-def _fmt_cell(v) -> str:
+def _fmt_cell(v) -> str:++++
     if v is None:
         return ""
     if isinstance(v, bool):

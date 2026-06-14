@@ -4,6 +4,37 @@ This repository is built for the paper [Towards Better Dynamic Graph Learning: N
 🔔 If you have any questions or suggestions, please feel free to let us know. 
 You can directly email [Le Yu](https://yule-buaa.github.io/) using the email address yule@buaa.edu.cn or post an issue on this repository.
 
+---
+
+## 🎓 Thesis fork (this repository)
+
+This is a fork of DyGLib extended with a thesis project on the `HT-Transformer` branch. The original
+DyGLib pipeline below is preserved and still works. The new work is a **tripartite (User, Streamer,
+Item/Room) temporal hypergraph link-prediction** task with a custom model `HTTransformer`, evaluated
+on the `kuailive_tripartite` dataset. See [`CLAUDE.md`](CLAUDE.md) for the full architecture/commands.
+
+```bash
+# Build the fixed, shared ranking-candidate set once (auto-built on first train run if skipped)
+python build_eval_candidates.py --verify
+
+# Train / evaluate HT-Transformer (or a DyGLib baseline) under the tripartite scoring head
+python train_tripartite_link_prediction.py --model_name HTTransformer --num_runs 5
+```
+
+**Evaluation protocol (tripartite).** Test ranking is 1 positive + N negatives per query. Negatives
+come from a **pre-built, model-independent candidate set** (`utils/eval_candidates.py`,
+`build_eval_candidates.py`) so every model and ablation ranks against byte-identical negatives. The
+mixture is harder than uniform — popularity-as-of-`t` (50%) + train-only user-similarity hard
+negatives (30%) + uniform (20%) — with an all-time false-negative filter, and is fully reproducible
+(data + seed). There is **no test-period leakage**: popularity uses history strictly `< t`,
+hard-negative statistics use the train split only, and only the false-negative filter consults the
+full timeline. Ranking metrics (`utils/metrics.py`) use a **tie-aware** HR/NDCG (expected value under
+a random tie-break), so a degenerate constant-score model reads as random (AUC ≈ 0.5, HR ≈ K/N)
+instead of a misleading perfect score. Pass `--no-use_fixed_eval_candidates` for the legacy
+on-the-fly uniform protocol (kept only for old-vs-new comparison).
+
+---
+
 ## 💥 News 💥
 
 - 🔥🔥🔥[2023/09] Our paper is accepted by **NeurIPS 2023 (Poster)**. The camera ready version is coming soon.

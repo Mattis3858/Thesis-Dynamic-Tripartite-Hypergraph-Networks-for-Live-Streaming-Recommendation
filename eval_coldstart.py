@@ -128,8 +128,15 @@ def get_eval_args() -> argparse.Namespace:
     parser.add_argument("--cooccurrence_dim", type=int, default=50)
     parser.add_argument("--max_input_sequence_length", type=int, default=32)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--num_ranking_negatives", type=int, default=99) 
+    parser.add_argument("--num_ranking_negatives", type=int, default=99)
     parser.add_argument("--eval_seed", type=int, default=0)
+    parser.add_argument(
+        "--eval_candidates_path",
+        type=str,
+        default=None,
+        help="If set, rank against this shared fixed candidate .npz (new protocol). "
+        "Default None = legacy on-the-fly uniform sampling.",
+    )
     parser.add_argument("--full_model_dir", type=str, default=str(DEFAULT_FULL_DIR))
     parser.add_argument("--run_seed", type=int, default=0)
     parser.add_argument("--full_save_model_name", type=str, default=None)
@@ -173,6 +180,12 @@ def main() -> None:
     load_ht_checkpoint(model, full_folder, full_stem, logger)
     model = convert_to_gpu(model, device=device)
 
+    eval_candidates = None
+    if args.eval_candidates_path:
+        from utils.eval_candidates import load_eval_candidates
+
+        eval_candidates = load_eval_candidates(args.eval_candidates_path)
+
     print("\n### Table 13 — Simulated Cold-Start Scenario Analysis ###")
     print("| Scenario | AUC | P@10 | R@10 | N@10 |")
     print("|----------|-----|------|------|------|")
@@ -182,7 +195,8 @@ def main() -> None:
         with cold_start_simulation_context(model, mask_u=mu, mask_s=ms, mask_i=mi):
             _loss, agg = evaluate_tripartite_ranking(
                 model=model, neighbor_sampler=full_neighbor_sampler, data=test_data, idx_data_loader=test_loader,
-                node_type_ids=node_type_ids, device=device, num_negatives=args.num_ranking_negatives, eval_rng=test_eval_rng, return_per_query=False,
+                node_type_ids=node_type_ids, device=device, num_negatives=args.num_ranking_negatives,
+                eval_rng=test_eval_rng, return_per_query=False, eval_candidates=eval_candidates,
             )
         print(f"| {setting_name} | {agg.get('roc_auc', float('nan')):.4f} | {agg.get('precision@10', float('nan')):.4f} | {agg.get('recall@10', float('nan')):.4f} | {agg.get('ndcg@10', float('nan')):.4f} |")
 
