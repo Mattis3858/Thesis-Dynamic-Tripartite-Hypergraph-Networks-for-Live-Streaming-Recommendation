@@ -187,10 +187,8 @@ class BiasAwareTripartiteMergeLayer(nn.Module):
         """
         g_v = torch.sigmoid(self.W_v(h_u))  # shape: [batch_size, d_out]
         g_w = torch.sigmoid(self.W_w(h_u))  # shape: [batch_size, d_out]
-        h_tilde_v = g_v  # shape: [batch_size, d_out]
-        h_tilde_w = g_w  # shape: [batch_size, d_out]        h_tilde_v = g_v * h_v  # shape: [batch_size, d_out]
-        # h_tilde_v = g_v * h_v  # shape: [batch_size, d_out]
-        # h_tilde_w = g_w * h_w  # shape: [batch_size, d_out]
+        h_tilde_v = g_v * h_v  # shape: [batch_size, d_out]
+        h_tilde_w = g_w * h_w  # shape: [batch_size, d_out]
         if self.fusion_mode == "concat":
             h_fused = torch.cat([h_u, h_tilde_v, h_tilde_w], dim=-1)  # shape: [batch_size, 3 * d_out]
         else:

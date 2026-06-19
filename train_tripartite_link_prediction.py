@@ -15,6 +15,7 @@ import os
 import shutil
 import time
 import warnings
+from collections import Counter
 
 import numpy as np
 import torch
@@ -83,6 +84,25 @@ def get_tripartite_train_args():
         type=int,
         default=1,
         help="Training negatives per positive triplet (1 = legacy 1:1 BCE/BPR pair).",
+    )
+    parser.add_argument(
+        "--train_neg_sampling",
+        type=str,
+        default="uniform",
+        choices=["uniform", "popularity"],
+        help="Training negative (v',w') sampler. 'uniform' (default): uniform over the "
+        "streamer/room pools (legacy). 'popularity': sample observed (streamer,room) combos in "
+        "proportion to their train-split frequency, aligning training negatives with the "
+        "popularity component of the fixed eval protocol (utils.eval_candidates). Adds a '_popneg' "
+        "checkpoint suffix so it never overwrites a uniform-neg run.",
+    )
+    parser.add_argument(
+        "--train_neg_power",
+        type=float,
+        default=1.0,
+        help="Exponent applied to combo counts for popularity sampling (1.0 = raw frequency; "
+        "0.75 = word2vec-style flattening that upweights tail combos). Only used when "
+        "--train_neg_sampling popularity.",
     )
     parser.add_argument(
         "--fusion_mode",
@@ -360,6 +380,70 @@ def _sample_negative_pairs(
         for j in range(num_negatives):
             v_neg[i, j], w_neg[i, j] = _sample_one_negative_pair(vp, wp, streamer_pool, room_pool, rng)
     return v_neg, w_neg
+
+
+class _PopularityNegativeSampler:
+    """
+    Sample negative (v', w') combos in proportion to their frequency in ``train_data``.
+
+    Aligns the training-negative distribution with the popularity component of the fixed
+    evaluation protocol (utils.eval_candidates), without per-batch ``as-of-t`` windowing: the
+    combo universe and weights are the **observed (streamer, room) pairs in the train split**
+    (no val/test leakage), precomputed once. Sampling is vectorised (one ``rng.choice`` per
+    batch), so it adds negligible time vs. the uniform sampler.
+
+    Returns the same shapes as ``_sample_negative_pairs`` (1-D for ``num_negatives == 1``, else
+    ``[b, num_negatives]``) and applies the same false-negative policy: only the exact positive
+    combo ``(v_pos, w_pos)`` is rejected (resampled), matching the uniform sampler.
+    """
+
+    def __init__(self, train_data: TripartiteData, power: float = 1.0):
+        combo_counter = Counter(
+            zip(train_data.streamer_node_ids.tolist(), train_data.item_node_ids.tolist())
+        )
+        combos = sorted(combo_counter)  # deterministic order
+        if not combos:
+            raise ValueError("train_data has no (streamer, room) combos for popularity sampling.")
+        self.combos = np.asarray(combos, dtype=np.int64).reshape(-1, 2)  # shape: [C, 2]
+        self.num_combos = self.combos.shape[0]
+        counts = np.array([combo_counter[c] for c in combos], dtype=np.float64)
+        if power != 1.0:
+            counts = counts**power
+        self.prob = counts / counts.sum()  # shape: [C]
+        self._combo_to_idx = {(int(v), int(w)): i for i, (v, w) in enumerate(combos)}
+
+    def sample(
+        self,
+        batch_v_pos: np.ndarray,
+        batch_w_pos: np.ndarray,
+        rng: np.random.RandomState,
+        num_negatives: int = 1,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if num_negatives < 1:
+            raise ValueError(f"num_negatives must be >= 1, got {num_negatives}")
+        b = len(batch_v_pos)
+        total = b * num_negatives
+        idx = rng.choice(self.num_combos, size=total, p=self.prob)  # shape: [total]
+        pos_idx = np.repeat(
+            np.array(
+                [self._combo_to_idx.get((int(batch_v_pos[i]), int(batch_w_pos[i])), -1) for i in range(b)],
+                dtype=np.int64,
+            ),
+            num_negatives,
+        )
+        # resample any draw that collided with its own positive combo (rare; popular combos collide more)
+        for j in np.where(idx == pos_idx)[0]:
+            for _ in range(50):
+                ci = int(rng.choice(self.num_combos, p=self.prob))
+                if ci != pos_idx[j]:
+                    idx[j] = ci
+                    break
+        sel = self.combos[idx]  # shape: [total, 2]
+        v_neg = sel[:, 0].astype(np.int64)
+        w_neg = sel[:, 1].astype(np.int64)
+        if num_negatives == 1:
+            return v_neg, w_neg
+        return v_neg.reshape(b, num_negatives), w_neg.reshape(b, num_negatives)
 
 
 def _forward_pos_neg_scores(
@@ -729,6 +813,7 @@ def train_one_epoch(
     train_rng: np.random.RandomState,
     train_neg_ratio: int = 1,
     loss_type: str = "bce",
+    neg_sampler: _PopularityNegativeSampler | None = None,
 ) -> tuple[float, dict]:
     model.train()
     model.set_neighbor_sampler(neighbor_sampler)
@@ -747,9 +832,12 @@ def train_one_epoch(
         bw = train_data.item_node_ids[idx]
         bt = train_data.node_interact_times[idx]
 
-        bv_neg, bw_neg = _sample_negative_pairs(
-            bv, bw, streamer_pool, room_pool, train_rng, num_negatives=train_neg_ratio
-        )
+        if neg_sampler is not None:
+            bv_neg, bw_neg = neg_sampler.sample(bv, bw, train_rng, num_negatives=train_neg_ratio)
+        else:
+            bv_neg, bw_neg = _sample_negative_pairs(
+                bv, bw, streamer_pool, room_pool, train_rng, num_negatives=train_neg_ratio
+            )
         batch_edge_ids = train_data.edge_ids[idx]
         y_pos, y_neg = _forward_pos_neg_scores(
             model, bu, bv, bw, bt, bv_neg, bw_neg, batch_edge_ids, tgn=tgn
@@ -988,6 +1076,16 @@ def main():
             args.early_stop_metric,
         )
 
+    # Training negative sampler: built once from the TRAIN split only (no val/test leakage).
+    train_neg_sampler = None
+    if args.train_neg_sampling == "popularity":
+        train_neg_sampler = _PopularityNegativeSampler(train_data, power=args.train_neg_power)
+        logging.info(
+            "Training negatives: popularity (power=%s) over %d observed train combos.",
+            args.train_neg_power,
+            train_neg_sampler.num_combos,
+        )
+
     best_val_loss_all_runs: list[float] = []
     test_metric_all_runs: list[dict] = []
 
@@ -1009,6 +1107,9 @@ def main():
                 suffix += f"_{args.loss_type}"
             if args.train_neg_ratio != 1:
                 suffix += f"_neg{args.train_neg_ratio}"
+
+        if args.train_neg_sampling != "uniform":
+            suffix += "_popneg"
 
         args.save_model_name = f"{args.model_name}{suffix}_seed{args.seed}"
         # =================================================
@@ -1180,6 +1281,7 @@ def main():
                 train_rng=train_rng,
                 train_neg_ratio=args.train_neg_ratio,
                 loss_type=args.loss_type,
+                neg_sampler=train_neg_sampler,
             )
 
             train_mem_backup = None
@@ -1329,6 +1431,7 @@ def main():
             summary["use_hetero_coocc"] = None
             summary["fusion_mode"] = None
         summary["train_neg_ratio"] = args.train_neg_ratio
+        summary["train_neg_sampling"] = args.train_neg_sampling
         summary["loss_type"] = args.loss_type
         for k, v in test_mean.items():
             summary[f"test_{k}"] = _json_scalar(v)
