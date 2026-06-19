@@ -21,6 +21,29 @@ python build_eval_candidates.py --verify
 python train_tripartite_link_prediction.py --model_name HTTransformer --num_runs 5
 ```
 
+**Running the thesis experiments.** The batch engine is `run_experiments.py`
+(`--mode overall | ablation | hyperparam`); it runs each model/config and appends a row to
+`experiment_results/results_{mode}.csv` (test_/val_ ranking metrics). Two thin PowerShell wrappers
+supply a shared fairness config (`common_config.ps1`, dot-sourced by both) so every model trains under
+an identical baseline (`--train_neg_ratio` / `--train_neg_sampling`, epochs, patience, batch, gpu) —
+edit alignment in one place.
+
+```powershell
+# Overall (main) comparison: HT-Transformer vs. all baselines, 5 seeds each -> results_overall.csv
+./run_main_comparison.ps1
+
+# Ablation (2^3 module flags) + hyperparameter grid -> results_ablation.csv / results_hyperparam.csv
+./run_experiments.ps1
+```
+
+Equivalent direct call (pass the alignment flags by hand; add `--dry_run` to preview commands):
+`python run_experiments.py --mode overall --num_runs 5 --train_neg_ratio 5 --train_neg_sampling popularity`
+
+Training and validation now use aligned negatives by default: `--train_neg_ratio 5
+--train_neg_sampling popularity`, and early-stopping selects checkpoints using a **popularity** 1-negative
+validation BCE (`--val_neg_sampling popularity`, train-split only) so model selection matches the eval
+difficulty. Pass `--val_neg_sampling uniform` to restore the legacy uniform validation negative.
+
 **Evaluation protocol (tripartite).** Test ranking is 1 positive + N negatives per query. Negatives
 come from a **pre-built, model-independent candidate set** (`utils/eval_candidates.py`,
 `build_eval_candidates.py`) so every model and ablation ranks against byte-identical negatives. The

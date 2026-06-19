@@ -80,7 +80,7 @@ def _ranking_metric_columns(prefix: str) -> list[str]:
 CSV_COLUMNS = _CSV_META_COLUMNS + _ranking_metric_columns("test_") + _ranking_metric_columns("val_")
 
 
-def _fmt_cell(v) -> str:++++
+def _fmt_cell(v) -> str:
     if v is None:
         return ""
     if isinstance(v, bool):

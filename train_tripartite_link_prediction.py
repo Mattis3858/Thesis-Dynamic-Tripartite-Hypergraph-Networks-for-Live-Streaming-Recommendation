@@ -105,6 +105,17 @@ def get_tripartite_train_args():
         "--train_neg_sampling popularity.",
     )
     parser.add_argument(
+        "--val_neg_sampling",
+        type=str,
+        default="popularity",
+        choices=["uniform", "popularity"],
+        help="Validation (early-stopping) negative (v',w') sampler for the 1-negative BCE. "
+        "'popularity' (default): sample observed (streamer,room) combos in proportion to their "
+        "TRAIN-split frequency, so the checkpoint-selection signal aligns with the popularity "
+        "component of the fixed eval protocol -- same cost as the uniform 1-neg validation. "
+        "'uniform' (legacy): uniform over the streamer/room pools.",
+    )
+    parser.add_argument(
         "--fusion_mode",
         type=str,
         default="concat",
@@ -871,10 +882,15 @@ def evaluate_valid_loss(
     node_type_ids: np.ndarray,
     device: str,
     val_rng: np.random.RandomState,
+    neg_sampler: _PopularityNegativeSampler | None = None,
 ) -> float:
     """
-    Lightweight validation: one random negative (v', w') per val triplet, mean BCE (no optimizer step).
+    Lightweight validation: one negative (v', w') per val triplet, mean BCE (no optimizer step).
     Same forward protocol as train_one_epoch.
+
+    If ``neg_sampler`` is given (popularity, train-split), the single negative is drawn from it so
+    that checkpoint selection aligns with the eval popularity component at the same cost; otherwise
+    the negative is uniform over the streamer/room pools (legacy).
     """
     model.eval()
     model.set_neighbor_sampler(neighbor_sampler)
@@ -892,7 +908,10 @@ def evaluate_valid_loss(
         bw = val_data.item_node_ids[idx]
         bt = val_data.node_interact_times[idx]
 
-        bv_neg, bw_neg = _sample_negative_pairs(bv, bw, streamer_pool, room_pool, val_rng)
+        if neg_sampler is not None:
+            bv_neg, bw_neg = neg_sampler.sample(bv, bw, val_rng, num_negatives=1)
+        else:
+            bv_neg, bw_neg = _sample_negative_pairs(bv, bw, streamer_pool, room_pool, val_rng)
 
         batch_edge_ids = val_data.edge_ids[idx]
         if tgn:
@@ -1085,6 +1104,22 @@ def main():
             args.train_neg_power,
             train_neg_sampler.num_combos,
         )
+
+    # Validation (early-stopping) negative sampler: built once from the TRAIN split only (no
+    # val/test leakage). Aligns the 1-neg validation BCE -- and therefore checkpoint selection --
+    # with the eval popularity component, at the same cost as the uniform 1-neg validation.
+    val_neg_sampler = None
+    if args.val_neg_sampling == "popularity":
+        if train_neg_sampler is not None and args.train_neg_power == 1.0:
+            val_neg_sampler = train_neg_sampler  # identical config; stateless aside from the rng
+        else:
+            val_neg_sampler = _PopularityNegativeSampler(train_data, power=1.0)
+        logging.info(
+            "Validation negatives: popularity (train-split, power=1.0) over %d observed train combos.",
+            val_neg_sampler.num_combos,
+        )
+    else:
+        logging.info("Validation negatives: uniform (legacy 1-neg BCE).")
 
     best_val_loss_all_runs: list[float] = []
     test_metric_all_runs: list[dict] = []
@@ -1297,6 +1332,7 @@ def main():
                 node_type_ids=node_type_ids,
                 device=args.device,
                 val_rng=val_loss_rng,
+                neg_sampler=val_neg_sampler,
             )
 
             # ranking-based validation monitoring (interface; default path is val_loss only)

@@ -1,48 +1,27 @@
-Write-Host "=== 開始執行論文後半段所有消融與超參數實驗 ===" -ForegroundColor Green
+﻿# =========================================================
+# 消融 + 超參數敏感度（HTTransformer only）。
+#
+# 薄包裝：交給 run_experiments.py，自動彙整成 experiment_results/results_ablation.csv
+# 與 results_hyperparam.csv。
+#   --mode ablation   ：--no-use_* 三個開關的完整 2^3 = 8 組合。
+#   --mode hyperparam ：patch_size {1,5,10,20} × channel_embedding_dim {32,64,128,256} = 16 組。
+#
+# 共用基準從 common_config.ps1 載入（與 run_main_comparison.ps1 同一份，baseline 設定一致）。
+# 主比較（HT vs. 所有 baseline）請改跑 run_main_comparison.ps1。
+# =========================================================
 
-# ---------------------------------------------------------
-# [實驗 5.8] 異質圖模組消融實驗
-# ---------------------------------------------------------
-# Write-Host "1. 訓練 w/o type-aware initialization" -ForegroundColor Cyan
-# python train_tripartite_link_prediction.py --model_name HTTransformer --no-use_type_init --num_epochs 50 --patience 10 --num_runs 1 --batch_size 64
+. "$PSScriptRoot\common_config.ps1"
 
-# Write-Host "2. 訓練 w/o heterogeneous co-occurrence" -ForegroundColor Cyan
-# python train_tripartite_link_prediction.py --model_name HTTransformer --no-use_hetero_coocc --num_epochs 50 --patience 10 --num_runs 1 --batch_size 64
+$AblationRuns = 1   # 消融/超參數通常 1 個 seed 即可
 
-# ---------------------------------------------------------
-# [實驗 5.11] 精準度架構微調實驗
-# ---------------------------------------------------------
-# Write-Host "3. 訓練 Alternative fusion design (Mean pooling)" -ForegroundColor Cyan
-# python train_tripartite_link_prediction.py --model_name HTTransformer --fusion_mode mean --num_epochs 30 --patience 10 --num_runs 1 --batch_size 64
+Write-Host "=== 消融 (2^3) + 超參數 (4×4)：run_experiments.py ===" -ForegroundColor Green
+Write-Host ("共用設定：neg_ratio={0} neg_sampling={1} epochs={2} patience={3} runs={4} batch={5}" `
+    -f $NegRatio, $NegSampling, $NumEpochs, $Patience, $AblationRuns, $BatchSize) -ForegroundColor DarkGray
 
-# Write-Host "4. 訓練 Top-ranked emphasis (BPR Loss)" -ForegroundColor Cyan
-# python train_tripartite_link_prediction.py --model_name HTTransformer --loss_type bpr --num_epochs 30 --patience 10 --num_runs 1 --batch_size 64
+Write-Host "[1/2] 消融 (ablation)" -ForegroundColor Cyan
+python run_experiments.py --mode ablation --num_runs $AblationRuns $Common
 
-# Write-Host "5. 訓練 Modified negative sampling (1對5負樣本)" -ForegroundColor Cyan
-# python train_tripartite_link_prediction.py --model_name HTTransformer --train_neg_ratio 5 --num_epochs 30 --patience 10 --num_runs 1 --batch_size 64
+Write-Host "[2/2] 超參數 (hyperparam)" -ForegroundColor Cyan
+python run_experiments.py --mode hyperparam --num_runs $AblationRuns $Common
 
-# ---------------------------------------------------------
-# [實驗 5.15] 超參數敏感度分析 (Patch Size)
-# ---------------------------------------------------------
-# Write-Host "6. 訓練 Patch Size 5" -ForegroundColor Yellow
-# python train_tripartite_link_prediction.py --model_name HTTransformer --patch_size 5 --num_epochs 30 --patience 10 --num_runs 1 --batch_size 64
-
-# Write-Host "7. 訓練 Patch Size 10" -ForegroundColor Yellow
-# python train_tripartite_link_prediction.py --model_name HTTransformer --patch_size 10 --num_epochs 30 --patience 10 --num_runs 1 --batch_size 64
-
-Write-Host "8. 訓練 Patch Size 20" -ForegroundColor Yellow
-python train_tripartite_link_prediction.py --model_name HTTransformer --patch_size 20 --num_epochs 30 --patience 10 --num_runs 1 --batch_size 64
-
-# ---------------------------------------------------------
-# [實驗 5.15] 超參數敏感度分析 (Embedding Dimension)
-# ---------------------------------------------------------
-Write-Host "9. 訓練 Embedding Dimension 32" -ForegroundColor Yellow
-python train_tripartite_link_prediction.py --model_name HTTransformer --channel_embedding_dim 32 --cooccurrence_dim 32 --num_epochs 30 --patience 10 --num_runs 1 --batch_size 64
-
-Write-Host "10. 訓練 Embedding Dimension 64" -ForegroundColor Yellow
-python train_tripartite_link_prediction.py --model_name HTTransformer --channel_embedding_dim 64 --cooccurrence_dim 64 --num_epochs 30 --patience 10 --num_runs 1 --batch_size 64
-
-Write-Host "11. 訓練 Embedding Dimension 128" -ForegroundColor Yellow
-python train_tripartite_link_prediction.py --model_name HTTransformer --channel_embedding_dim 128 --cooccurrence_dim 128 --num_epochs 30 --patience 10 --num_runs 1 --batch_size 64
-
-Write-Host "=== 所有訓練任務已全數派發完畢！可以安心去睡覺了！ ===" -ForegroundColor Green
+Write-Host "=== 完成 -> experiment_results/results_ablation.csv, results_hyperparam.csv ===" -ForegroundColor Green
