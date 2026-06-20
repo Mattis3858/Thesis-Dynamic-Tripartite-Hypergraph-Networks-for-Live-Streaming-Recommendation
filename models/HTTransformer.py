@@ -57,28 +57,6 @@ class Tripartite3DCooccurrenceEncoder(nn.Module):
             self.mlp_v = None
             self.mlp_w = None
 
-    def _counts_tensor_for_sequence(
-        self,
-        seq_ids: np.ndarray,
-        count_u: dict,
-        count_v: dict,
-        count_w: dict,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Per-position 3D counts for one sequence in the batch."""
-        cu = torch.zeros(len(seq_ids), dtype=torch.float32, device=device)
-        cv = torch.zeros(len(seq_ids), dtype=torch.float32, device=device)
-        cw = torch.zeros(len(seq_ids), dtype=torch.float32, device=device)
-        for idx in range(seq_ids.shape[0]):
-            k = int(seq_ids[idx])
-            if k == 0:
-                continue
-            cu[idx] = float(count_u.get(k, 0))
-            cv[idx] = float(count_v.get(k, 0))
-            cw[idx] = float(count_w.get(k, 0))
-        out = torch.stack([cu, cv, cw], dim=-1)  # shape: [seq_len, 3]
-        return out
-
     def forward(
         self,
         u_padded_neighbor_ids: np.ndarray,
@@ -86,75 +64,51 @@ class Tripartite3DCooccurrenceEncoder(nn.Module):
         w_padded_neighbor_ids: np.ndarray,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
+        Vectorised 3D neighbour co-occurrence (replaces the old per-row dict loop).
+
+        For each position (id k) in a sequence, its 3D count is (C_u(k), C_v(k), C_w(k)) =
+        (#occurrences of k in the u-/v-/w-sequence of the same batch row). The scalar MLPs are
+        applied to all positions at once. Padding positions (id 0) are zeroed in the output; the
+        count of a non-pad id never includes padding (0 != k), so only the final mask matters and
+        the result is identical to the old implementation at every non-pad position.
+
         :param u_padded_neighbor_ids: ndarray, shape [batch_size, L_u]
         :param v_padded_neighbor_ids: ndarray, shape [batch_size, L_v]
         :param w_padded_neighbor_ids: ndarray, shape [batch_size, L_w]
         :return: co-occurrence features for u/v/w sequences, each [batch_size, L_*, cooccurrence_dim]
         """
-        batch_size = u_padded_neighbor_ids.shape[0]
-        u_feats, v_feats, w_feats = [], [], []
-        if self.hetero:
-            dev = next(self.mlp_u.parameters()).device
-        else:
-            dev = next(self.shared_mlp.parameters()).device
+        dev = next(self.mlp_u.parameters()).device if self.hetero else next(self.shared_mlp.parameters()).device
 
-        for b in range(batch_size):
-            su = u_padded_neighbor_ids[b]
-            sv = v_padded_neighbor_ids[b]
-            sw = w_padded_neighbor_ids[b]
+        su = torch.from_numpy(u_padded_neighbor_ids).to(dev)  # shape: [batch_size, L_u]
+        sv = torch.from_numpy(v_padded_neighbor_ids).to(dev)  # shape: [batch_size, L_v]
+        sw = torch.from_numpy(w_padded_neighbor_ids).to(dev)  # shape: [batch_size, L_w]
 
-            def counter(ids: np.ndarray):
-                d = {}
-                for k in ids:
-                    kk = int(k)
-                    if kk == 0:
-                        continue
-                    d[kk] = d.get(kk, 0) + 1
-                return d
+        def co_counts(a: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+            """Per row, count occurrences of each id in ``a`` within ``ref`` -> [batch_size, len(a)]."""
+            eq = a.unsqueeze(2) == ref.unsqueeze(1)  # shape: [batch_size, len(a), len(ref)]
+            return eq.sum(dim=2).to(torch.float32)
 
-            count_u, count_v, count_w = counter(su), counter(sv), counter(sw)
-
-            counts_u = self._counts_tensor_for_sequence(su, count_u, count_v, count_w, dev)  # shape: [L_u, 3]
-            counts_v = self._counts_tensor_for_sequence(sv, count_u, count_v, count_w, dev)  # shape: [L_v, 3]
-            counts_w = self._counts_tensor_for_sequence(sw, count_u, count_v, count_w, dev)  # shape: [L_w, 3]
-
-            cu = counts_u[:, 0:1]  # shape: [L_u, 1]
-            cv = counts_u[:, 1:2]  # shape: [L_u, 1]
-            cw = counts_u[:, 2:3]  # shape: [L_u, 1]
+        def encode(c_u: torch.Tensor, c_v: torch.Tensor, c_w: torch.Tensor) -> torch.Tensor:
+            """Apply the (hetero or shared) scalar MLPs and sum -> [batch_size, L, cooccurrence_dim]."""
+            b, length = c_u.shape
             if self.hetero:
-                zu = self.mlp_u(cu) + self.mlp_v(cv) + self.mlp_w(cw)  # shape: [L_u, cooccurrence_dim]
+                out = self.mlp_u(c_u.reshape(-1, 1)) + self.mlp_v(c_v.reshape(-1, 1)) + self.mlp_w(c_w.reshape(-1, 1))
             else:
-                zu = self.shared_mlp(cu) + self.shared_mlp(cv) + self.shared_mlp(cw)
-            u_feats.append(zu)
+                out = (
+                    self.shared_mlp(c_u.reshape(-1, 1))
+                    + self.shared_mlp(c_v.reshape(-1, 1))
+                    + self.shared_mlp(c_w.reshape(-1, 1))
+                )
+            return out.reshape(b, length, self.cooccurrence_dim)
 
-            cu = counts_v[:, 0:1]  # shape: [L_v, 1]
-            cv = counts_v[:, 1:2]  # shape: [L_v, 1]
-            cw = counts_v[:, 2:3]  # shape: [L_v, 1]
-            if self.hetero:
-                zv = self.mlp_u(cu) + self.mlp_v(cv) + self.mlp_w(cw)  # shape: [L_v, cooccurrence_dim]
-            else:
-                zv = self.shared_mlp(cu) + self.shared_mlp(cv) + self.shared_mlp(cw)
-            v_feats.append(zv)
+        # u-sequence: counts of its ids within (u, v, w); same pattern for v- and w-sequences.
+        u_out = encode(co_counts(su, su), co_counts(su, sv), co_counts(su, sw))  # shape: [batch_size, L_u, cooccurrence_dim]
+        v_out = encode(co_counts(sv, su), co_counts(sv, sv), co_counts(sv, sw))  # shape: [batch_size, L_v, cooccurrence_dim]
+        w_out = encode(co_counts(sw, su), co_counts(sw, sv), co_counts(sw, sw))  # shape: [batch_size, L_w, cooccurrence_dim]
 
-            cu = counts_w[:, 0:1]  # shape: [L_w, 1]
-            cv = counts_w[:, 1:2]  # shape: [L_w, 1]
-            cw = counts_w[:, 2:3]  # shape: [L_w, 1]
-            if self.hetero:
-                zw = self.mlp_u(cu) + self.mlp_v(cv) + self.mlp_w(cw)  # shape: [L_w, cooccurrence_dim]
-            else:
-                zw = self.shared_mlp(cu) + self.shared_mlp(cv) + self.shared_mlp(cw)
-            w_feats.append(zw)
-
-        u_out = torch.stack(u_feats, dim=0)  # shape: [batch_size, L_u, cooccurrence_dim]
-        v_out = torch.stack(v_feats, dim=0)  # shape: [batch_size, L_v, cooccurrence_dim]
-        w_out = torch.stack(w_feats, dim=0)  # shape: [batch_size, L_w, cooccurrence_dim]
-
-        mask_u = torch.from_numpy(u_padded_neighbor_ids == 0).to(dev)  # shape: [batch_size, L_u]
-        mask_v = torch.from_numpy(v_padded_neighbor_ids == 0).to(dev)  # shape: [batch_size, L_v]
-        mask_w = torch.from_numpy(w_padded_neighbor_ids == 0).to(dev)  # shape: [batch_size, L_w]
-        u_out = u_out.masked_fill(mask_u.unsqueeze(-1), 0.0)  # shape: [batch_size, L_u, cooccurrence_dim]
-        v_out = v_out.masked_fill(mask_v.unsqueeze(-1), 0.0)  # shape: [batch_size, L_v, cooccurrence_dim]
-        w_out = w_out.masked_fill(mask_w.unsqueeze(-1), 0.0)  # shape: [batch_size, L_w, cooccurrence_dim]
+        u_out = u_out.masked_fill((su == 0).unsqueeze(-1), 0.0)  # shape: [batch_size, L_u, cooccurrence_dim]
+        v_out = v_out.masked_fill((sv == 0).unsqueeze(-1), 0.0)  # shape: [batch_size, L_v, cooccurrence_dim]
+        w_out = w_out.masked_fill((sw == 0).unsqueeze(-1), 0.0)  # shape: [batch_size, L_w, cooccurrence_dim]
 
         return u_out, v_out, w_out
 
