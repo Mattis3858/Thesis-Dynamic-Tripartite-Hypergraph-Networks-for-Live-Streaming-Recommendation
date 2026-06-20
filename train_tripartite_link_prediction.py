@@ -1359,9 +1359,15 @@ def main():
             if args.model_name == "TGN":
                 train_mem_backup = model.backup_memory_bank()
 
+            # Validation uses the FULL neighbor sampler, matching the test protocol (and DyGLib's
+            # transductive convention). It is leakage-free: a val query at time t only ever fetches
+            # neighbours strictly before t, so val-period history is visible (as it legitimately is
+            # at inference) while later test-period edges are never returned. Using the train-only
+            # sampler here starved val queries of their recent neighbours and made val metrics
+            # un-representative of test (ndcg gap ~0.13 vs ~0.99).
             val_loss = evaluate_valid_loss(
                 model=model,
-                neighbor_sampler=train_neighbor_sampler,
+                neighbor_sampler=full_neighbor_sampler,
                 val_data=val_data,
                 val_loader=val_loader,
                 loss_fn=val_loss_fn,
@@ -1376,7 +1382,7 @@ def main():
             if val_candidates is not None:
                 _vl, val_rank_agg = evaluate_tripartite_ranking(
                     model=model,
-                    neighbor_sampler=train_neighbor_sampler,
+                    neighbor_sampler=full_neighbor_sampler,  # match test (leakage-free, see above)
                     data=val_data,
                     idx_data_loader=val_ranking_loader,
                     node_type_ids=node_type_ids,
