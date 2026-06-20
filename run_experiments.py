@@ -64,6 +64,11 @@ _CSV_META_COLUMNS = [
     "use_bias_gate",
     "use_type_init",
     "use_hetero_coocc",
+    # training-protocol provenance (filled from the metrics JSON by the generic loop below)
+    "train_neg_sampling",
+    "train_neg_ratio",
+    "loss_type",
+    "fusion_mode",
 ]
 
 

@@ -239,6 +239,23 @@ def get_tripartite_train_args():
         "phase (using it for the thesis means RE-TRAINING all models; not done this round).",
     )
     parser.add_argument(
+        "--log_val_ranking",
+        action="store_true",
+        help="Diagnostic: each epoch, compute and LOG validation ranking metrics (ndcg@5/@10, "
+        "recall@10) under the fixed-candidate protocol, WITHOUT using them for model selection "
+        "(early stopping stays on --early_stop_metric). Use this to observe whether ranking peaks "
+        "later than the val_loss-selected epoch before committing to a ranking-based early stop. "
+        "Adds one subsampled ranking pass per epoch (see --val_ranking_subsample).",
+    )
+    parser.add_argument(
+        "--val_ranking_subsample",
+        type=int,
+        default=2000,
+        help="When --log_val_ranking (or ranking-based --early_stop_metric) is on, evaluate ranking "
+        "on this many randomly-chosen (fixed across runs) val queries per epoch instead of all of "
+        "them, to keep the per-epoch cost small. 0 = use the full val split.",
+    )
+    parser.add_argument(
         "--time_gap",
         type=int,
         default=2000,
@@ -1072,10 +1089,13 @@ def main():
             args.eval_seed + 1,
         )
 
-    # Ranking-based validation monitoring (interface for the next phase; default off). Building the
-    # val candidate set is cheap and model-independent, so we do it once here when selected.
+    # Ranking-based validation monitoring. Built once (model-independent) when either ranking-based
+    # early stopping is selected, or --log_val_ranking asks to observe the ranking trend per epoch.
+    # The per-epoch ranking pass uses a fixed subsample loader (val_ranking_loader) to stay cheap.
     val_candidates = None
-    if args.early_stop_metric != "val_loss":
+    val_ranking_loader = val_loader
+    val_ranking_n = len(val_data.user_node_ids)
+    if args.early_stop_metric != "val_loss" or args.log_val_ranking:
         val_cfg = EvalCandidateConfig(
             num_negatives=args.num_ranking_negatives,
             ratio_popularity=args.neg_ratio_popularity,
@@ -1089,11 +1109,27 @@ def main():
         val_candidates = build_eval_candidates(
             val_data, full_data, node_type_ids, val_cfg, train_data=train_data
         )
-        logging.warning(
-            "early_stop_metric=%s selects checkpoints by VALIDATION RANKING, not BCE. This changes "
-            "model selection -- re-train all models before reporting; not part of this round.",
-            args.early_stop_metric,
-        )
+        n_val = len(val_data.user_node_ids)
+        if 0 < args.val_ranking_subsample < n_val:
+            sub_rng = np.random.RandomState(args.eval_seed)
+            sub_idx = np.sort(sub_rng.choice(n_val, size=args.val_ranking_subsample, replace=False))
+            val_ranking_loader = get_idx_data_loader(
+                indices_list=sub_idx.tolist(), batch_size=args.batch_size, shuffle=False
+            )
+            val_ranking_n = int(args.val_ranking_subsample)
+        if args.log_val_ranking:
+            logging.info(
+                "Observation: logging val ranking (ndcg@5/@10, recall@10) on %d val queries per "
+                "epoch; early stopping stays on '%s' (NOT changed).",
+                val_ranking_n,
+                args.early_stop_metric,
+            )
+        if args.early_stop_metric != "val_loss":
+            logging.warning(
+                "early_stop_metric=%s selects checkpoints by VALIDATION RANKING, not BCE. This "
+                "changes model selection -- re-train all models before reporting.",
+                args.early_stop_metric,
+            )
 
     # Training negative sampler: built once from the TRAIN split only (no val/test leakage).
     train_neg_sampler = None
@@ -1335,21 +1371,31 @@ def main():
                 neg_sampler=val_neg_sampler,
             )
 
-            # ranking-based validation monitoring (interface; default path is val_loss only)
+            # ranking-based validation monitoring: log the trend (observation) and/or feed early stop
             val_monitor_value = None
             if val_candidates is not None:
                 _vl, val_rank_agg = evaluate_tripartite_ranking(
                     model=model,
                     neighbor_sampler=train_neighbor_sampler,
                     data=val_data,
-                    idx_data_loader=val_loader,
+                    idx_data_loader=val_ranking_loader,
                     node_type_ids=node_type_ids,
                     device=args.device,
                     num_negatives=args.num_ranking_negatives,
                     eval_rng=val_loss_rng,
                     eval_candidates=val_candidates,
                 )
-                val_monitor_value = val_rank_agg.get(args.early_stop_metric.replace("val_", ""))
+                if args.log_val_ranking:
+                    logger.info(
+                        "Epoch %s | val ranking (n=%s) ndcg@5 %.4f | ndcg@10 %.4f | recall@10 %.4f",
+                        epoch + 1,
+                        val_ranking_n,
+                        val_rank_agg.get("ndcg@5", float("nan")),
+                        val_rank_agg.get("ndcg@10", float("nan")),
+                        val_rank_agg.get("recall@10", float("nan")),
+                    )
+                if args.early_stop_metric != "val_loss":
+                    val_monitor_value = val_rank_agg.get(args.early_stop_metric.replace("val_", ""))
 
             if args.model_name == "TGN" and train_mem_backup is not None:
                 model.reload_memory_bank(train_mem_backup)
