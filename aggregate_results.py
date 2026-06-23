@@ -150,6 +150,10 @@ def main() -> None:
     ap.add_argument("--primary_metric", type=str, default="ndcg@10",
                     help="Metric used for the HT-vs-baseline delta / beyond-1-std flag.")
     ap.add_argument("--results_dir", type=str, default=str(ROOT / "experiment_results"))
+    ap.add_argument("--exclude", type=str, default="TGN",
+                    help="Comma-separated model names to omit from the table (default: TGN -- its "
+                    "memory is not advanced through the eval timeline, so its number is not "
+                    "comparable; see run_experiments.py). Pass '' to include everything.")
     args = ap.parse_args()
 
     # Windows consoles default to a non-UTF-8 codepage (e.g. cp950); force UTF-8 so the table's
@@ -163,6 +167,16 @@ def main() -> None:
     if not groups:
         print(f"No per-seed result JSONs found under saved_results/*/{args.dataset_name}/*_seed*.json")
         return
+
+    excluded = {m.strip() for m in args.exclude.split(",") if m.strip()}
+    if excluded:
+        dropped = sorted(k for k, g in groups.items() if g["model"] in excluded)
+        groups = {k: g for k, g in groups.items() if g["model"] not in excluded}
+        if dropped:
+            print(f"[excluded from table: {', '.join(sorted(excluded))}] dropped groups: {', '.join(dropped)}")
+        if not groups:
+            print("All groups were excluded; nothing to report.")
+            return
 
     metric_names = _all_metric_names(groups)
     agg = {key: _aggregate_group(g, metric_names) for key, g in groups.items()}

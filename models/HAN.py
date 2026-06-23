@@ -47,6 +47,16 @@ class HAN(nn.Module):
         self.input_proj = nn.Linear(in_dim, hidden_dim)
         nn.init.xavier_uniform_(self.input_proj.weight)
 
+        # Learnable per-node ID embedding. This dataset's node_raw_features are all-zero, so the
+        # projected features carry no node identity; without this, every node collapses to the same
+        # vector and HAN degenerates (train AUC ~0.5). Learnable ID embeddings are the standard way
+        # to apply a GNN to a featureless graph (cf. LightGCN), i.e. the faithful instantiation of
+        # HAN here, not a deviation. padding_idx=0 keeps the padding node at zero.
+        self.node_id_embedding = nn.Embedding(num_nodes, hidden_dim, padding_idx=0)
+        nn.init.normal_(self.node_id_embedding.weight, std=0.1)
+        with torch.no_grad():
+            self.node_id_embedding.weight[0].zero_()
+
         biases = build_meta_path_biases(train_data, num_nodes, nhood=meta_path_nhood)
         for i, b in enumerate(biases):
             self.register_buffer(f"bias_mp{i}", b)
@@ -81,7 +91,8 @@ class HAN(nn.Module):
         """No-op: HAN uses fixed meta-path graphs from train hyperedges."""
 
     def encode_all_nodes(self) -> torch.Tensor:
-        x = self.input_proj(self.node_features.to(self.device))
+        ids = torch.arange(self.num_nodes, device=self.device)
+        x = self.input_proj(self.node_features.to(self.device)) + self.node_id_embedding(ids)
         x = F.dropout(x, p=self.dropout, training=self.training)
 
         mp_embeds: list[torch.Tensor] = []

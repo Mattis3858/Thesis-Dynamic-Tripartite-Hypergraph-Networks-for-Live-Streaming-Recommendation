@@ -35,6 +35,11 @@ TRAIN = ROOT / "train_tripartite_link_prediction.py"
 # CSV columns -- start fresh results_*.csv files rather than appending to old ones.
 TRIPARTITE_RANKING_KS = (1, 3, 5, 10, 20, 50, 100)
 
+# NOTE: TGN is intentionally excluded. It trains fine (train AUC ~0.99) but the fixed-candidate
+# ranking eval never advances its persistent memory through the val/test timeline, so at test time
+# its memory is stale (end of training) and the ranking collapses. Reporting that number would
+# understate TGN due to an eval-harness limitation, not a model failure, so it is omitted. Re-add it
+# only if the eval is extended to update TGN memory chronologically through the evaluation split.
 OVERALL_MODELS = [
     "HTTransformer",
     "HyperHawkes",
@@ -45,7 +50,6 @@ OVERALL_MODELS = [
     "GraphMixer",
     "CAWN",
     "TCL",
-    "TGN",
 ]
 
 # Paper hyperparameter search grid
