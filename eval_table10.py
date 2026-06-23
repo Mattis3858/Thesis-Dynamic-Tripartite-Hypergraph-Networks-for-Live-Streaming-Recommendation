@@ -265,8 +265,15 @@ def get_eval_args() -> argparse.Namespace:
         "--eval_candidates_path",
         type=str,
         default=None,
-        help="If set, rank against this shared fixed candidate .npz (new protocol; both models read "
-        "the same negatives). Default None = legacy on-the-fly uniform sampling.",
+        help="Path to the shared fixed candidate .npz. Default: auto-resolve to "
+        "eval_candidates/{dataset}_test_joint_vw_seed{eval_seed+1}.npz (same file the main "
+        "comparison uses), so Table 10 is comparable to the main table.",
+    )
+    parser.add_argument(
+        "--no_fixed_eval_candidates",
+        action="store_true",
+        help="Opt out of the fixed candidate set and use legacy on-the-fly UNIFORM negatives. "
+        "NOT recommended: the result is not comparable to the main table.",
     )
     parser.add_argument("--run_seed", type=int, default=0)
     parser.add_argument("--full_model_dir", type=str, default=str(DEFAULT_FULL_DIR))
@@ -341,12 +348,28 @@ def main() -> None:
         num_heads=args.num_heads, dropout=args.dropout, max_input_sequence_length=args.max_input_sequence_length,
     )
 
+    # Fixed shared candidates by DEFAULT (consistent with the main comparison); legacy uniform is
+    # opt-in only, else Table 10's group-wise numbers would be incomparable to the main protocol.
     eval_candidates = None
-    if args.eval_candidates_path:
+    if args.no_fixed_eval_candidates:
+        logger.warning(
+            "Using LEGACY on-the-fly UNIFORM negatives (--no_fixed_eval_candidates); not comparable "
+            "to the main table."
+        )
+    else:
         from utils.eval_candidates import load_eval_candidates
 
-        eval_candidates = load_eval_candidates(args.eval_candidates_path)
-        logger.info("Using shared fixed eval candidates from %s", args.eval_candidates_path)
+        cand_path = args.eval_candidates_path or str(
+            ROOT / "eval_candidates" / f"{args.dataset_name}_test_joint_vw_seed{args.eval_seed + 1}.npz"
+        )
+        if not Path(cand_path).exists():
+            raise FileNotFoundError(
+                f"Fixed eval candidates not found: {cand_path}\n"
+                "Build it by running training once (auto-builds) or `python build_eval_candidates.py`, "
+                "pass --eval_candidates_path, or use --no_fixed_eval_candidates for legacy uniform."
+            )
+        eval_candidates = load_eval_candidates(cand_path)
+        logger.info("Table 10 ranking against fixed candidates: %s", cand_path)
 
     results: dict[str, dict[str, dict[str, float]]] = {}
     query_counts: dict[str, dict[str, int]] = {MODEL_FULL: {}, MODEL_WO_GATE: {}}

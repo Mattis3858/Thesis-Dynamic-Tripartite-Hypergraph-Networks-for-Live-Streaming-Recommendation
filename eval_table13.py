@@ -159,8 +159,15 @@ def get_eval_args() -> argparse.Namespace:
         "--eval_candidates_path",
         type=str,
         default=None,
-        help="If set, rank against this shared fixed candidate .npz (new protocol). "
-        "Default None = legacy on-the-fly uniform sampling.",
+        help="Path to the shared fixed candidate .npz. Default: auto-resolve to "
+        "eval_candidates/{dataset}_test_joint_vw_seed{eval_seed+1}.npz (the same file the main "
+        "comparison uses), so Table 13 is comparable to the main table.",
+    )
+    parser.add_argument(
+        "--no_fixed_eval_candidates",
+        action="store_true",
+        help="Opt out of the fixed candidate set and use legacy on-the-fly UNIFORM negatives. "
+        "NOT recommended: the result is not comparable to the main table.",
     )
     parser.add_argument(
         "--full_model_dir",
@@ -284,11 +291,31 @@ def main() -> None:
             "Checkpoint was trained with use_bias_gate=False; Table 13 masking still uses loaded head."
         )
 
+    # Use the fixed shared candidates by DEFAULT (consistent with the main comparison). Falling
+    # back to legacy on-the-fly uniform negatives is opt-in only -- otherwise Table 13 would rank
+    # against different, easier negatives and be incomparable to the main table.
     eval_candidates = None
-    if args.eval_candidates_path:
+    if args.no_fixed_eval_candidates:
+        logger.warning(
+            "Using LEGACY on-the-fly UNIFORM negatives (--no_fixed_eval_candidates). These are NOT "
+            "the fixed popularity/hard candidates the main comparison uses; Table 13 will not be "
+            "comparable to the main table."
+        )
+    else:
         from utils.eval_candidates import load_eval_candidates
 
-        eval_candidates = load_eval_candidates(args.eval_candidates_path)
+        cand_path = args.eval_candidates_path or str(
+            ROOT / "eval_candidates" / f"{args.dataset_name}_test_joint_vw_seed{args.eval_seed + 1}.npz"
+        )
+        if not Path(cand_path).exists():
+            raise FileNotFoundError(
+                f"Fixed eval candidates not found: {cand_path}\n"
+                "This is the shared candidate set the main comparison ranks against. Build it by "
+                "running training once (auto-builds), or `python build_eval_candidates.py`, or pass "
+                "--eval_candidates_path, or use --no_fixed_eval_candidates for legacy uniform."
+            )
+        eval_candidates = load_eval_candidates(cand_path)
+        logger.info("Table 13 ranking against fixed candidates: %s", cand_path)
 
     results: dict[str, dict[str, float]] = {}
 
