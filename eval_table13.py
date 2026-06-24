@@ -123,6 +123,36 @@ def print_table13_markdown(results: dict[str, dict[str, float]]) -> None:
         print(_pad(row))
 
 
+def write_table13_csv(results: dict[str, dict[str, float]], path: str) -> None:
+    """One row per task setting (tripartite / masked) with all ranking metrics; for the thesis."""
+    import csv as _csv
+
+    present: list[str] = []
+    for setting in results:
+        for k in results[setting]:
+            if k not in present:
+                present.append(k)
+    headline = [
+        "roc_auc", "average_precision", "precision@1", "ndcg@3",
+        "precision@5", "ndcg@5", "ndcg@10", "recall@10",
+    ]
+    metric_names = [m for m in headline if m in present] + [m for m in sorted(present) if m not in headline]
+
+    def _cell(v) -> str:
+        if isinstance(v, float):
+            return "nan" if np.isnan(v) else f"{v:.6f}"
+        return "" if v is None else str(v)
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = _csv.writer(f)
+        w.writerow(["task_setting", "mask_streamer", "mask_room"] + metric_names)
+        for setting_name, mv, mw in EVAL_SETTINGS:
+            agg = results.get(setting_name, {})
+            w.writerow([setting_name, mv, mw] + [_cell(agg.get(m)) for m in metric_names])
+    print(f"Wrote Table 13 metrics -> {path}")
+
+
 def get_eval_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Table 13: tripartite vs masked 2D link prediction (Full HT-Transformer)."
@@ -181,6 +211,12 @@ def get_eval_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Checkpoint stem (default HTTransformer_seed{run_seed}).",
+    )
+    parser.add_argument(
+        "--out_csv",
+        type=str,
+        default=str(ROOT / "experiment_results" / "table13_masking.csv"),
+        help="Where to write the masking-ablation metrics CSV (one row per task setting).",
     )
     return parser.parse_args()
 
@@ -347,6 +383,7 @@ def main() -> None:
         )
 
     print_table13_markdown(results)
+    write_table13_csv(results, args.out_csv)
 
 
 if __name__ == "__main__":

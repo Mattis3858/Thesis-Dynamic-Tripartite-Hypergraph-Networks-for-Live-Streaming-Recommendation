@@ -147,7 +147,43 @@ def get_eval_args() -> argparse.Namespace:
     parser.add_argument("--full_model_dir", type=str, default=str(DEFAULT_FULL_DIR))
     parser.add_argument("--run_seed", type=int, default=0)
     parser.add_argument("--full_save_model_name", type=str, default=None)
+    parser.add_argument(
+        "--out_csv",
+        type=str,
+        default=str(ROOT / "experiment_results" / "table_coldstart.csv"),
+        help="Where to write the cold-start scenario metrics CSV (one row per scenario).",
+    )
     return parser.parse_args()
+
+
+def write_coldstart_csv(results: dict[str, dict[str, float]], path: str) -> None:
+    """One row per cold-start scenario with all ranking metrics; for the thesis / records."""
+    import csv as _csv
+
+    present: list[str] = []
+    for s in results:
+        for k in results[s]:
+            if k not in present:
+                present.append(k)
+    headline = [
+        "roc_auc", "average_precision", "precision@1", "ndcg@3",
+        "precision@5", "ndcg@5", "ndcg@10", "recall@10",
+    ]
+    metric_names = [m for m in headline if m in present] + [m for m in sorted(present) if m not in headline]
+
+    def _cell(v) -> str:
+        if isinstance(v, float):
+            return "nan" if np.isnan(v) else f"{v:.6f}"
+        return "" if v is None else str(v)
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = _csv.writer(f)
+        w.writerow(["scenario", "mask_u", "mask_s", "mask_i"] + metric_names)
+        for setting_name, mu, ms, mi in EVAL_SETTINGS:
+            agg = results.get(setting_name, {})
+            w.writerow([setting_name, mu, ms, mi] + [_cell(agg.get(m)) for m in metric_names])
+    print(f"Wrote cold-start metrics -> {path}")
 
 def main() -> None:
     warnings.filterwarnings("ignore")
@@ -210,10 +246,11 @@ def main() -> None:
         eval_candidates = load_eval_candidates(cand_path)
         logger.info("Cold-start ranking against fixed candidates: %s", cand_path)
 
-    print("\n### Table 13 — Simulated Cold-Start Scenario Analysis ###")
+    print("\n### Simulated Cold-Start Scenario Analysis ###")
     print("| Scenario | AUC | P@10 | R@10 | N@10 |")
     print("|----------|-----|------|------|------|")
 
+    results: dict[str, dict[str, float]] = {}
     for setting_name, mu, ms, mi in EVAL_SETTINGS:
         test_eval_rng = np.random.RandomState(seed=eval_rank_seed)
         with cold_start_simulation_context(model, mask_u=mu, mask_s=ms, mask_i=mi):
@@ -222,7 +259,10 @@ def main() -> None:
                 node_type_ids=node_type_ids, device=device, num_negatives=args.num_ranking_negatives,
                 eval_rng=test_eval_rng, return_per_query=False, eval_candidates=eval_candidates,
             )
+        results[setting_name] = agg
         print(f"| {setting_name} | {agg.get('roc_auc', float('nan')):.4f} | {agg.get('precision@10', float('nan')):.4f} | {agg.get('recall@10', float('nan')):.4f} | {agg.get('ndcg@10', float('nan')):.4f} |")
+
+    write_coldstart_csv(results, args.out_csv)
 
 if __name__ == "__main__":
     main()

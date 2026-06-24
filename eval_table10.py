@@ -280,7 +280,13 @@ def get_eval_args() -> argparse.Namespace:
     parser.add_argument("--full_save_model_name", type=str, default=None)
     parser.add_argument("--wo_gate_model_dir", type=str, default=str(DEFAULT_WO_GATE_DIR))
     parser.add_argument("--wo_gate_save_model_name", type=str, default=None)
-    
+    parser.add_argument(
+        "--out_csv",
+        type=str,
+        default=str(ROOT / "experiment_results" / "table10_group_metrics.csv"),
+        help="Where to write the group-wise metrics CSV (one row per group x model).",
+    )
+
     g_ti = parser.add_mutually_exclusive_group()
     g_ti.add_argument("--use_type_init", dest="use_type_init", action="store_true")
     g_ti.add_argument("--no-use_type_init", dest="use_type_init", action="store_false")
@@ -291,6 +297,44 @@ def get_eval_args() -> argparse.Namespace:
     parser.set_defaults(use_hetero_coocc=True)
 
     return parser.parse_args()
+
+
+def _ordered_metric_names(results: dict) -> list[str]:
+    """Headline metrics first, then any remaining ones, for a stable CSV column order."""
+    present: list[str] = []
+    for mk in results:
+        for g in results[mk]:
+            for k in results[mk][g]:
+                if k not in present:
+                    present.append(k)
+    headline = [
+        "roc_auc", "average_precision", "precision@1", "ndcg@3",
+        "precision@5", "ndcg@5", "ndcg@10", "recall@10",
+    ]
+    return [m for m in headline if m in present] + [m for m in sorted(present) if m not in headline]
+
+
+def write_table10_csv(results: dict, query_counts: dict, path: str) -> None:
+    """One row per (bias group x model) with all ranking metrics; for the thesis / records."""
+    import csv as _csv
+
+    metric_names = _ordered_metric_names(results)
+
+    def _cell(v) -> str:
+        if isinstance(v, float):
+            return "nan" if np.isnan(v) else f"{v:.6f}"
+        return "" if v is None else str(v)
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = _csv.writer(f)
+        w.writerow(["group", "model", "n_queries"] + metric_names)
+        for g in GROUP_ORDER:
+            for mk in (MODEL_FULL, MODEL_WO_GATE):
+                gm = results.get(mk, {}).get(g, {})
+                n = query_counts.get(mk, {}).get(g, "")
+                w.writerow([g, MODEL_DISPLAY.get(mk, mk), n] + [_cell(gm.get(m)) for m in metric_names])
+    print(f"Wrote Table 10 metrics -> {path}")
 
 
 def main() -> None:
@@ -399,6 +443,7 @@ def main() -> None:
         query_counts[model_key] = counts
 
     print_table10_markdown(results, counts=query_counts)
+    write_table10_csv(results, query_counts, args.out_csv)
 
 if __name__ == "__main__":
     main()
