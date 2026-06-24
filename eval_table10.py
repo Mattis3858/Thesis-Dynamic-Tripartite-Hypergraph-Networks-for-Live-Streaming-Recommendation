@@ -314,6 +314,58 @@ def _ordered_metric_names(results: dict) -> list[str]:
     return [m for m in headline if m in present] + [m for m in sorted(present) if m not in headline]
 
 
+def _paired_wilcoxon(full_pq: list, wo_pq: list, idxs: list[int], metric: str) -> dict:
+    """Per-query paired Full-vs-w/o-gate comparison on a metric over query indices ``idxs``."""
+    from scipy.stats import wilcoxon
+
+    a = np.array([full_pq[i].get(metric, np.nan) for i in idxs], dtype=np.float64)
+    b = np.array([wo_pq[i].get(metric, np.nan) for i in idxs], dtype=np.float64)
+    keep = ~(np.isnan(a) | np.isnan(b))
+    a, b = a[keep], b[keep]
+    diff = a - b
+    wins, losses, ties = int(np.sum(diff > 0)), int(np.sum(diff < 0)), int(np.sum(diff == 0))
+    p = float("nan")
+    if np.any(diff != 0):
+        try:
+            _stat, p = wilcoxon(a, b, zero_method="wilcox", alternative="two-sided")
+            p = float(p)
+        except ValueError:
+            p = float("nan")
+    return {"metric": metric, "n": int(a.size), "wins": wins, "losses": losses, "ties": ties,
+            "mean_diff": float(np.mean(diff)) if a.size else float("nan"), "p_value": p}
+
+
+def write_table10_paired_csv(per_query_by_model: dict, test_data, user_group_map: dict, path: str) -> None:
+    """Per-group paired Wilcoxon (Full vs w/o gate); prints a table and writes CSV."""
+    if MODEL_FULL not in per_query_by_model or MODEL_WO_GATE not in per_query_by_model:
+        return
+    full_pq, wo_pq = per_query_by_model[MODEL_FULL], per_query_by_model[MODEL_WO_GATE]
+    non_unknown = set(GROUP_ORDER) - {BIAS_UNKNOWN}
+    group_idx: dict[str, list[int]] = {g: [] for g in GROUP_ORDER}
+    for i in range(test_data.num_interactions):
+        g = user_group_map.get(int(test_data.user_node_ids[i]), BIAS_UNKNOWN)
+        group_idx[g if g in non_unknown else BIAS_UNKNOWN].append(i)
+
+    print("\n### Table 10 — Paired Wilcoxon (Full vs w/o gate), per group ###")
+    print("| group | metric | wins | losses | ties | mean Δ | p-value |")
+    print("|---|---|---|---|---|---|---|")
+    rows = []
+    for g in GROUP_ORDER:
+        for metric in ("ndcg@10", "precision@1"):
+            r = _paired_wilcoxon(full_pq, wo_pq, group_idx[g], metric)
+            pstr = "nan" if np.isnan(r["p_value"]) else f"{r['p_value']:.2e}"
+            print(f"| {g} | {metric} | {r['wins']} | {r['losses']} | {r['ties']} | {r['mean_diff']:+.4f} | {pstr} |")
+            rows.append({"group": g, **r})
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    import csv as _csv
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = _csv.DictWriter(f, fieldnames=["group", "metric", "n", "wins", "losses", "ties", "mean_diff", "p_value"])
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    print(f"Wrote Table 10 paired tests -> {path}")
+
+
 def write_table10_csv(results: dict, query_counts: dict, path: str) -> None:
     """One row per (bias group x model) with all ranking metrics; for the thesis / records."""
     import csv as _csv
@@ -417,6 +469,7 @@ def main() -> None:
 
     results: dict[str, dict[str, dict[str, float]]] = {}
     query_counts: dict[str, dict[str, int]] = {MODEL_FULL: {}, MODEL_WO_GATE: {}}
+    per_query_by_model: dict[str, list] = {}
 
     for model_key, use_bias_gate, folder, stem in (
         (MODEL_FULL, True, full_folder, full_stem),
@@ -433,6 +486,7 @@ def main() -> None:
             eval_rng=test_eval_rng, return_per_query=True, eval_candidates=eval_candidates,
         )
         
+        per_query_by_model[model_key] = list(per_query)
         by_group = aggregate_metrics_by_bias_group(test_data, per_query, user_group_map)
         results[model_key] = by_group
 
@@ -444,6 +498,10 @@ def main() -> None:
 
     print_table10_markdown(results, counts=query_counts)
     write_table10_csv(results, query_counts, args.out_csv)
+    write_table10_paired_csv(
+        per_query_by_model, test_data, user_group_map,
+        str(Path(args.out_csv).with_name("table10_paired_tests.csv")),
+    )
 
 if __name__ == "__main__":
     main()

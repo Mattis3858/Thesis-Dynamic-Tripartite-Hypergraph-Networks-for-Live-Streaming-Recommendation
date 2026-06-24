@@ -33,6 +33,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from scipy.stats import wilcoxon
 
 from eval_table10 import _checkpoint_exists, _resolve_checkpoint_dir, build_ht_transformer, load_ht_checkpoint
 from train_tripartite_link_prediction import evaluate_tripartite_ranking
@@ -91,6 +92,31 @@ def _cell(v) -> str:
     if isinstance(v, float):
         return "nan" if np.isnan(v) else f"{v:.6f}"
     return "" if v is None else str(v)
+
+
+def paired_test(full_pq: list[dict], abl_pq: list[dict], idxs: np.ndarray, metric: str) -> dict:
+    """
+    Per-query paired comparison of ``full`` vs an ablation on a metric, over query indices ``idxs``.
+
+    Returns win/loss/tie counts (full vs ablation, per query) and a two-sided Wilcoxon signed-rank
+    p-value on the paired metric values (ties dropped). Because it is paired (same query, same
+    candidates), it detects a small but consistent gap that seed-level std would drown out.
+    """
+    a = np.array([full_pq[i].get(metric, np.nan) for i in idxs], dtype=np.float64)
+    b = np.array([abl_pq[i].get(metric, np.nan) for i in idxs], dtype=np.float64)
+    keep = ~(np.isnan(a) | np.isnan(b))
+    a, b = a[keep], b[keep]
+    diff = a - b
+    wins, losses, ties = int(np.sum(diff > 0)), int(np.sum(diff < 0)), int(np.sum(diff == 0))
+    p = float("nan")
+    if np.any(diff != 0):
+        try:
+            _stat, p = wilcoxon(a, b, zero_method="wilcox", alternative="two-sided")
+            p = float(p)
+        except ValueError:
+            p = float("nan")
+    return {"metric": metric, "n": int(a.size), "wins": wins, "losses": losses, "ties": ties,
+            "mean_diff": float(np.mean(diff)) if a.size else float("nan"), "p_value": p}
 
 
 def get_args() -> argparse.Namespace:
@@ -184,6 +210,7 @@ def main() -> None:
     )
 
     rows: list[tuple[str, str, int, dict]] = []  # (label, split, n, agg)
+    per_query_by_label: dict[str, list] = {}
     for label, bg, ti, co, abl in DEFAULT_CONFIGS:
         stem = f"HTTransformer{abl}{args.ckpt_suffix}_seed{args.run_seed}"
         folder, stem = _resolve_checkpoint_dir(
@@ -203,6 +230,7 @@ def main() -> None:
             eval_rng=np.random.RandomState(args.eval_seed + 1), return_per_query=True, eval_candidates=eval_candidates,
         )
         pq = list(per_query)
+        per_query_by_label[label] = pq
         novel_m = [pq[i] for i in range(n_total) if novel[i]]
         cont_m = [pq[i] for i in range(n_total) if not novel[i]]
         rows.append((label, "all", n_total, mean_metric_dicts(pq)))
@@ -238,6 +266,30 @@ def main() -> None:
             a = novel_by_label[label]
             n10, p1 = a.get("ndcg@10", float("nan")), a.get("precision@1", float("nan"))
             print(f"| {label} | {n10:.4f} | {full_n10 - n10:+.4f} | {p1:.4f} | {full_p1 - p1:+.4f} |")
+
+    # per-query paired significance: Full vs each ablation on the NOVEL subset (ndcg@10 + AP=recip.rank)
+    if "full" in per_query_by_label:
+        novel_idx = np.where(novel)[0]
+        full_pq = per_query_by_label["full"]
+        pt_rows: list[dict] = []
+        print(f"\n### Paired Wilcoxon (NOVEL subset, n={n_novel}): Full vs ablation ###")
+        print("| ablation | metric | wins | losses | ties | mean Δ | p-value |")
+        print("|---|---|---|---|---|---|---|")
+        for label in per_query_by_label:
+            if label == "full":
+                continue
+            for metric in ("ndcg@10", "average_precision"):
+                r = paired_test(full_pq, per_query_by_label[label], novel_idx, metric)
+                pstr = "nan" if np.isnan(r["p_value"]) else f"{r['p_value']:.2e}"
+                print(f"| {label} | {metric} | {r['wins']} | {r['losses']} | {r['ties']} | {r['mean_diff']:+.4f} | {pstr} |")
+                pt_rows.append({"ablation": label, **r})
+        pt_path = str(Path(args.out_csv).with_name("novelty_paired_tests.csv"))
+        with open(pt_path, "w", newline="", encoding="utf-8") as f:
+            w = _csv.DictWriter(f, fieldnames=["ablation", "metric", "n", "wins", "losses", "ties", "mean_diff", "p_value"])
+            w.writeheader()
+            for r in pt_rows:
+                w.writerow(r)
+        print(f"\nWrote paired tests -> {pt_path}")
 
 
 if __name__ == "__main__":
