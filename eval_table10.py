@@ -121,6 +121,9 @@ def build_ht_transformer(
     num_heads: int,
     dropout: float,
     max_input_sequence_length: int,
+    drop_streamer: bool = False,
+    drop_room: bool = False,
+    no_time: bool = False,
 ) -> HTTransformer:
     return HTTransformer(
         node_raw_features=node_raw_features,
@@ -140,6 +143,9 @@ def build_ht_transformer(
         use_bias_gate=use_bias_gate,
         use_type_init=use_type_init,
         use_hetero_coocc=use_hetero_coocc,
+        drop_streamer=drop_streamer,
+        drop_room=drop_room,
+        no_time=no_time,
     )
 
 

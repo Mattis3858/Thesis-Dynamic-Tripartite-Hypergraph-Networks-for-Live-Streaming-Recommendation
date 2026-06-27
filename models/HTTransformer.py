@@ -177,6 +177,9 @@ class HTTransformer(nn.Module):
         use_type_init: bool = True,
         use_hetero_coocc: bool = True,
         fusion_mode: str = "concat",
+        drop_streamer: bool = False,
+        drop_room: bool = False,
+        no_time: bool = False,
     ):
         """
         :param node_raw_features: ndarray, shape (num_nodes + 1, node_feat_dim)
@@ -211,6 +214,12 @@ class HTTransformer(nn.Module):
         self.use_bias_gate = use_bias_gate
         self.use_type_init = use_type_init
         self.use_hetero_coocc = use_hetero_coocc
+        # Modality-ablation switches (train+test consistent): zero a channel so the model never sees
+        # the streamer / room representation, or the time encoding. Pure forward behaviour -- no
+        # parameter-shape change, so checkpoints remain interchangeable with the full model.
+        self.drop_streamer = drop_streamer
+        self.drop_room = drop_room
+        self.no_time = no_time
         if fusion_mode not in ("concat", "mean"):
             raise ValueError(f"fusion_mode must be 'concat' or 'mean', got {fusion_mode!r}")
         self.fusion_mode = fusion_mode
@@ -451,6 +460,11 @@ class HTTransformer(nn.Module):
         v_n, v_e, v_tf = self.get_features(interact_times, v_pad_ids, v_pad_e, v_pad_t)
         w_n, w_e, w_tf = self.get_features(interact_times, w_pad_ids, w_pad_e, w_pad_t)
 
+        if self.no_time:  # temporal ablation: blank the time-encoding channel (keep neighbour sampling)
+            u_tf = torch.zeros_like(u_tf)
+            v_tf = torch.zeros_like(v_tf)
+            w_tf = torch.zeros_like(w_tf)
+
         u_pn, u_pe, u_pt, u_pc = self.get_patches(u_n, u_e, u_tf, u_co, self.patch_size)
         v_pn, v_pe, v_pt, v_pc = self.get_patches(v_n, v_e, v_tf, v_co, self.patch_size)
         w_pn, w_pe, w_pt, w_pc = self.get_patches(w_n, w_e, w_tf, w_co, self.patch_size)
@@ -458,6 +472,12 @@ class HTTransformer(nn.Module):
         zu = self._project_and_fuse_patches(u_pn, u_pe, u_pt, u_pc)  # shape: [batch_size, l_u, 4 * hidden_dim]
         zv = self._project_and_fuse_patches(v_pn, v_pe, v_pt, v_pc)  # shape: [batch_size, l_v, 4 * hidden_dim]
         zw = self._project_and_fuse_patches(w_pn, w_pe, w_pt, w_pc)  # shape: [batch_size, l_w, 4 * hidden_dim]
+
+        # modality ablation: blank the streamer / room channel so the model is trained+tested without it
+        if self.drop_streamer:
+            zv = torch.zeros_like(zv)
+        if self.drop_room:
+            zw = torch.zeros_like(zw)
 
         z = torch.cat([zu, zv, zw], dim=1)  # shape: [batch_size, l_u + l_v + l_w, 4 * hidden_dim]
 

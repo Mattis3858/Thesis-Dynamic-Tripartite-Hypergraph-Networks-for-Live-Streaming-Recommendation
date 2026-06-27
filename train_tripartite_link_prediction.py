@@ -80,6 +80,25 @@ def get_tripartite_train_args():
     )
     parser.set_defaults(use_hetero_coocc=True)
     parser.add_argument(
+        "--drop_streamer",
+        action="store_true",
+        help="HTTransformer modality ablation: zero the streamer channel at train AND test (model "
+        "never sees the streamer representation). Suffix _drop_streamer. Proves the streamer "
+        "modality contributes if results drop vs full tripartite.",
+    )
+    parser.add_argument(
+        "--drop_room",
+        action="store_true",
+        help="HTTransformer modality ablation: zero the room/item channel at train AND test. Suffix _drop_room.",
+    )
+    parser.add_argument(
+        "--no_time",
+        action="store_true",
+        help="HTTransformer temporal ablation: zero the time-encoding channel at train AND test "
+        "(neighbour sampling unchanged). Suffix _no_time. Combine with --sample_neighbor_strategy "
+        "uniform for a fully time-blind model (also removes recency-of-selection).",
+    )
+    parser.add_argument(
         "--train_neg_ratio",
         type=int,
         default=1,
@@ -1178,9 +1197,17 @@ def main():
                 suffix += f"_{args.loss_type}"
             if args.train_neg_ratio != 1:
                 suffix += f"_neg{args.train_neg_ratio}"
+            if args.drop_streamer:
+                suffix += "_drop_streamer"
+            if args.drop_room:
+                suffix += "_drop_room"
+            if args.no_time:
+                suffix += "_no_time"
 
         if args.train_neg_sampling != "uniform":
             suffix += "_popneg"
+        if args.sample_neighbor_strategy != "recent":
+            suffix += f"_{args.sample_neighbor_strategy}smp"
 
         args.save_model_name = f"{args.model_name}{suffix}_seed{args.seed}"
         # =================================================
@@ -1272,6 +1299,9 @@ def main():
                 use_type_init=args.use_type_init,
                 use_hetero_coocc=args.use_hetero_coocc,
                 fusion_mode=args.fusion_mode,
+                drop_streamer=args.drop_streamer,
+                drop_room=args.drop_room,
+                no_time=args.no_time,
             )
         elif args.model_name in TRIPARTITE_BASELINE_MODELS:
             model = BaselineTripartiteWrapper(
