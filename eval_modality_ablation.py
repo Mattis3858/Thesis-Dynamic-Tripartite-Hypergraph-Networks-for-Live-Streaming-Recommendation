@@ -90,8 +90,8 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--num_ranking_negatives", type=int, default=99)
     p.add_argument("--eval_seed", type=int, default=0)
     p.add_argument("--run_seed", type=int, default=0)
-    p.add_argument("--ckpt_suffix", type=str, default="_neg5_popneg",
-                   help="Shared checkpoint-name tail after any ablation suffix (aligned protocol).")
+    p.add_argument("--neg_tag", type=str, default="_neg5", help="Checkpoint name tag for train_neg_ratio (aligned protocol).")
+    p.add_argument("--pop_tag", type=str, default="_popneg", help="Checkpoint name tag for popularity negatives.")
     p.add_argument("--eval_candidates_path", type=str, default=None)
     p.add_argument("--out_csv", type=str, default=str(ROOT / "experiment_results" / "modality_ablation.csv"))
     return p.parse_args()
@@ -104,15 +104,21 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("eval_modality_ablation")
 
-    S = args.ckpt_suffix
     run = args.run_seed
+    # Checkpoint-name order matches the trainer's suffix block: _neg5 -> ablation flag -> _popneg ->
+    # _uniformsmp (drop_*/no_time are appended AFTER _neg5, before _popneg).
+    NEG, POP = args.neg_tag, args.pop_tag
+
+    def stem(abl: str, smp: str = "") -> str:
+        return f"HTTransformer{NEG}{abl}{POP}{smp}_seed{run}"
+
     # (label, drop_streamer, drop_room, no_time, sample_strategy, checkpoint stem)
     configs = [
-        ("full", False, False, False, "recent", f"HTTransformer{S}_seed{run}"),
-        ("drop_streamer", True, False, False, "recent", f"HTTransformer_drop_streamer{S}_seed{run}"),
-        ("drop_room", False, True, False, "recent", f"HTTransformer_drop_room{S}_seed{run}"),
-        ("no_time", False, False, True, "recent", f"HTTransformer_no_time{S}_seed{run}"),
-        ("no_time_uniform", False, False, True, "uniform", f"HTTransformer_no_time{S}_uniformsmp_seed{run}"),
+        ("full", False, False, False, "recent", stem("")),
+        ("drop_streamer", True, False, False, "recent", stem("_drop_streamer")),
+        ("drop_room", False, True, False, "recent", stem("_drop_room")),
+        ("no_time", False, False, True, "recent", stem("_no_time")),
+        ("no_time_uniform", False, False, True, "uniform", stem("_no_time", "_uniformsmp")),
     ]
 
     (
