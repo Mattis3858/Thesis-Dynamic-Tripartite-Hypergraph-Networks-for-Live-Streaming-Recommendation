@@ -194,6 +194,13 @@ def get_tripartite_train_args():
     )
     parser.add_argument("--num_ranking_negatives", type=int, default=99, help="99 negatives + 1 positive = 100 candidates")
     parser.add_argument("--eval_seed", type=int, default=0, help="seed for ranking negative sampling in val/test")
+    parser.add_argument(
+        "--max_test_queries",
+        type=int,
+        default=0,
+        help="Cap the final test-ranking to a fixed random sample of N test queries (0 = use all). "
+        "Decouples eval cost from dataset size on large data; statistically valid. Uses eval_seed.",
+    )
 
     # --- fixed, shared test-candidate set (new evaluation protocol; see utils.eval_candidates) ---
     g_fc = parser.add_mutually_exclusive_group()
@@ -630,19 +637,26 @@ def evaluate_tripartite_cold_start_by_split(
     train_data: TripartiteData,
     test_data: TripartiteData,
     per_query_metrics: list[dict],
+    query_indices: np.ndarray | None = None,
 ) -> dict[str, dict]:
     """
     Split test ranking metrics into three cold-start subsets (exactly one endpoint unseen in train).
+
+    ``query_indices`` maps per_query_metrics[k] -> test_data row query_indices[k] (needed when the
+    test ranking was capped to a subsample via --max_test_queries). Default None = all rows in order.
     """
-    if len(per_query_metrics) != len(test_data.user_node_ids):
-        raise ValueError("per_query_metrics length must match test_data size.")
+    if query_indices is None:
+        query_indices = np.arange(len(test_data.user_node_ids))
+    if len(per_query_metrics) != len(query_indices):
+        raise ValueError("per_query_metrics length must match query_indices length.")
     train_nodes = _train_tripartite_node_set(train_data)
     buckets: dict[str, list[dict]] = {
         "new_u_old_v_old_w": [],
         "old_u_new_v_old_w": [],
         "old_u_old_v_new_w": [],
     }
-    for i, m in enumerate(per_query_metrics):
+    for k, m in enumerate(per_query_metrics):
+        i = int(query_indices[k])
         u = int(test_data.user_node_ids[i])
         v = int(test_data.streamer_node_ids[i])
         w = int(test_data.item_node_ids[i])
@@ -1047,8 +1061,16 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
     )
+    n_test = len(test_data.user_node_ids)
+    if 0 < args.max_test_queries < n_test:
+        test_query_indices = np.sort(
+            np.random.RandomState(args.eval_seed).choice(n_test, args.max_test_queries, replace=False)
+        )
+        logging.info("Capping test ranking to %d/%d random queries (--max_test_queries).", len(test_query_indices), n_test)
+    else:
+        test_query_indices = np.arange(n_test)
     test_loader = get_idx_data_loader(
-        indices_list=list(range(len(test_data.user_node_ids))),
+        indices_list=test_query_indices.tolist(),
         batch_size=args.batch_size,
         shuffle=False,
     )
@@ -1472,7 +1494,7 @@ def main():
             eval_candidates=test_candidates,
         )
         test_cold_start_metrics = evaluate_tripartite_cold_start_by_split(
-            train_data, test_data, test_per_query_metrics
+            train_data, test_data, test_per_query_metrics, query_indices=test_query_indices
         )
 
         logger.info("test ranking loss (diagnostic BCE on 1+99) %.4f", test_loss)
