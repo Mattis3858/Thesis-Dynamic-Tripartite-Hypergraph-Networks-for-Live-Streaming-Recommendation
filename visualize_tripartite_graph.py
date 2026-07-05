@@ -53,10 +53,12 @@ def sample_subgraph(df: pd.DataFrame, n_users: int, max_hyperedges: int, seed: i
     if len(cand) == 0:
         cand = deg.index.to_numpy()
     users = rng.choice(cand, size=min(n_users, len(cand)), replace=False)
-    sub = df[df["u"].isin(users)].drop_duplicates(subset=["u", "streamer", "room"])
-    if len(sub) > max_hyperedges:
-        sub = sub.sample(n=max_hyperedges, random_state=seed)
-    return sub.reset_index(drop=True)
+    sub = df[df["u"].isin(users)]
+    # weight = how many interactions that (u, streamer, room) combo has (edge thickness)
+    grp = sub.groupby(["u", "streamer", "room"]).size().reset_index(name="weight")
+    if len(grp) > max_hyperedges:
+        grp = grp.sample(n=max_hyperedges, random_state=seed)
+    return grp.reset_index(drop=True)
 
 
 def _cluster_positions(ids, center, base_radius, rng):
@@ -111,7 +113,8 @@ def main() -> None:
     deg = defaultdict(int)
     for _, r in sub.iterrows():
         for c in ("u", "streamer", "room"):
-            deg[int(r[c])] += 1
+            deg[int(r[c])] += int(r["weight"])
+    wmax = float(sub["weight"].max()) if len(sub) else 1.0
 
     try:
         import matplotlib
@@ -128,16 +131,17 @@ def main() -> None:
     fig, ax = plt.subplots(figsize=(7.2, 6.0))
     ax.set_facecolor(SURFACE); fig.patch.set_facecolor(SURFACE)
 
-    # hyperedges as light triangles (u–streamer, streamer–room, u–room)
+    # hyperedges as triangles (u–streamer, streamer–room, u–room); thickness+opacity ∝ interactions
     for _, r in sub.iterrows():
         u, s, w = int(r["u"]), int(r["streamer"]), int(r["room"])
+        frac = float(r["weight"]) / wmax
         tri = [pos[u], pos[s], pos[w], pos[u]]
         xs, ys = zip(*tri)
-        ax.plot(xs, ys, color=LINE_INK, alpha=0.28, linewidth=1.0, zorder=1)
+        ax.plot(xs, ys, color=LINE_INK, alpha=0.20 + 0.55 * frac, linewidth=0.7 + 3.3 * frac, zorder=1)
 
     def draw_nodes(ids, color, label):
         xs = [pos[i][0] for i in ids]; ys = [pos[i][1] for i in ids]
-        sizes = [90 + 45 * deg[i] for i in ids]
+        sizes = [70 + 34 * math.sqrt(deg[i]) for i in ids]
         ax.scatter(xs, ys, s=sizes, c=color, edgecolors=EDGE_INK, linewidths=1.3, zorder=3, label=label)
 
     draw_nodes(users, COL_USER, "User")
@@ -153,7 +157,7 @@ def main() -> None:
         Line2D([0], [0], marker="o", color="none", markerfacecolor=COL_USER, markeredgecolor=EDGE_INK, markersize=11, label="User"),
         Line2D([0], [0], marker="o", color="none", markerfacecolor=COL_STREAMER, markeredgecolor=EDGE_INK, markersize=11, label=lab_s),
         Line2D([0], [0], marker="o", color="none", markerfacecolor=COL_ROOM, markeredgecolor=EDGE_INK, markersize=11, label=lab_r),
-        Line2D([0], [0], color=LINE_INK, alpha=0.5, linewidth=1.2, label="Interaction (hyperedge)"),
+        Line2D([0], [0], color=LINE_INK, alpha=0.6, linewidth=2.6, label="Interaction (thicker = more frequent)"),
     ]
     ax.legend(handles=handles, loc="upper right", frameon=False, fontsize=9)
     ax.set_title(
