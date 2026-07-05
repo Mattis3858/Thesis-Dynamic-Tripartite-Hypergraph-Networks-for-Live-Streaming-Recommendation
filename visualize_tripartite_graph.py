@@ -59,18 +59,22 @@ def sample_subgraph(df: pd.DataFrame, n_users: int, max_hyperedges: int, seed: i
     return sub.reset_index(drop=True)
 
 
-def _cluster_positions(ids, center, base_radius):
-    """Arrange a type's nodes on a circle around its corner (radius grows with count)."""
+def _cluster_positions(ids, center, base_radius, rng):
+    """Scatter a type's nodes organically around its corner (jittered angle/radius, not a rigid ring)."""
     ids = sorted(ids)
     n = len(ids)
-    r = base_radius * (0.6 + 0.12 * math.sqrt(max(n, 1)))
+    base = base_radius * (0.7 + 0.13 * math.sqrt(max(n, 1)))
     pos = {}
     for i, nid in enumerate(ids):
         if n == 1:
-            pos[nid] = center
+            ang = rng.uniform(0, 2 * math.pi)
+            rr = base * 0.3
         else:
-            a = 2 * math.pi * i / n - math.pi / 2
-            pos[nid] = (center[0] + r * math.cos(a), center[1] + r * math.sin(a))
+            ang = 2 * math.pi * i / n + rng.uniform(-0.55, 0.55)  # uneven angular spacing
+            rr = base * rng.uniform(0.5, 1.2)                     # uneven radius
+        x = center[0] + rr * math.cos(ang) + rng.normal(0, 0.13)
+        y = center[1] + rr * math.sin(ang) + rng.normal(0, 0.13)
+        pos[nid] = (x, y)
     return pos
 
 
@@ -93,11 +97,16 @@ def main() -> None:
     streamers = set(int(x) for x in sub["streamer"])
     rooms = set(int(x) for x in sub["room"])
 
-    # triangle corners: users bottom-left, streamers top, rooms bottom-right
+    # triangle corners: users bottom-left, streamers top, rooms bottom-right. Corners jittered a
+    # touch too, so the overall layout isn't a perfect equilateral triangle.
+    layout_rng = np.random.RandomState(args.seed + 100)
+    c_user = (-3.2 + layout_rng.uniform(-0.4, 0.4), -1.9 + layout_rng.uniform(-0.4, 0.4))
+    c_streamer = (0.0 + layout_rng.uniform(-0.4, 0.4), 3.4 + layout_rng.uniform(-0.4, 0.4))
+    c_room = (3.2 + layout_rng.uniform(-0.4, 0.4), -1.9 + layout_rng.uniform(-0.4, 0.4))
     pos = {}
-    pos.update(_cluster_positions(users, (-3.2, -1.9), 1.6))
-    pos.update(_cluster_positions(streamers, (0.0, 3.4), 1.6))
-    pos.update(_cluster_positions(rooms, (3.2, -1.9), 1.6))
+    pos.update(_cluster_positions(users, c_user, 1.6, layout_rng))
+    pos.update(_cluster_positions(streamers, c_streamer, 1.6, layout_rng))
+    pos.update(_cluster_positions(rooms, c_room, 1.6, layout_rng))
 
     deg = defaultdict(int)
     for _, r in sub.iterrows():
