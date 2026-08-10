@@ -54,6 +54,7 @@ from eval_streamer_group import (
 )
 from train_tripartite_link_prediction import evaluate_tripartite_ranking
 from utils.DataLoader import get_idx_data_loader, get_tripartite_link_prediction_data
+from utils.roles import detect_roles
 from utils.utils import convert_to_gpu, get_neighbor_sampler, get_tripartite_neighbor_sampler
 
 ROOT = Path(__file__).resolve().parent
@@ -366,6 +367,21 @@ def main() -> None:
             )
         eval_candidates = load_eval_candidates(cand_path)
         logger.info("Ranking against fixed candidates: %s", cand_path)
+
+    # The column named "streamer" is not always the streamer (see utils/roles.py), so state the
+    # real identity of the chosen --cold_role instead of letting the user assume it.
+    mapping = detect_roles(full_data)
+    if args.cold_role in ("streamer", "item"):
+        attr = ROLE_ATTR[args.cold_role]
+        real_role = "streamer" if attr == mapping.streamer_attr else "room/item"
+        print(f"--cold_role {args.cold_role} -> data.{attr}, which this dataset's structure "
+              f"identifies as the real {real_role.upper()}.")
+        if args.cold_role == "streamer" and mapping.swapped:
+            print("!! WARNING: on this dataset the real streamers live in the OTHER column. "
+                  "For a genuine new-streamer scenario use --cold_role item.")
+        elif args.cold_role == "item" and not mapping.swapped:
+            print("!! WARNING: on this dataset --cold_role item masks rooms/items, not streamers. "
+                  "For a new-streamer scenario use --cold_role streamer.")
 
     tables, popular = build_proxy_tables(train_data, args.cold_role)
     partners = PARTNERS[args.cold_role]

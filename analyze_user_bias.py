@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 from utils.DataLoader import get_tripartite_link_prediction_data
+from utils.roles import RoleMapping, detect_roles, role_ids
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_OUT_DIR = ROOT / "experiment_results"
@@ -38,17 +39,21 @@ def _herfindahl(counts: Counter) -> float:
     return float(np.sum(proportions**2))
 
 
-def compute_user_hhi_from_train(train_data) -> dict[int, dict]:
+def compute_user_hhi_from_train(train_data, mapping: RoleMapping) -> dict[int, dict]:
     """
     Aggregate train hyperedges (u, s, r) per user; return stats per user_id.
+
+    Roles come from ``mapping`` rather than from the column names: on datasets built without
+    remap_kuailive_etypes.py the column called "streamer" actually holds rooms, which would
+    otherwise make streamer_hhi measure room concentration (see utils/roles.py).
     """
     streamer_counts: dict[int, Counter] = defaultdict(Counter)
     room_counts: dict[int, Counter] = defaultdict(Counter)
     interaction_count: dict[int, int] = defaultdict(int)
 
     u_ids = train_data.user_node_ids
-    s_ids = train_data.streamer_node_ids
-    r_ids = train_data.item_node_ids
+    s_ids = role_ids(train_data, mapping, "streamer")
+    r_ids = role_ids(train_data, mapping, "room")
     for i in range(train_data.num_interactions):
         u = int(u_ids[i])
         s = int(s_ids[i])
@@ -70,17 +75,25 @@ def compute_user_hhi_from_train(train_data) -> dict[int, dict]:
 def _assign_cluster_labels(centroids: np.ndarray) -> dict[int, str]:
     """
     Map cluster_id -> bias_group using centroid comparison (k=3).
+
+    Labels come from each cluster's RELATIVE position on the two axes, not from a per-axis
+    argmax. The streamer axis saturates (most users concentrate on a single streamer, so their
+    HHI is ~1.0), and on a saturated axis an argmax picks an arbitrary cluster: the group that
+    is high on streamer HHI *and* high on room HHI would win the streamer label even though what
+    actually distinguishes it is its room concentration. Z-scoring each axis across the
+    centroids and ranking by the difference makes the label reflect which axis a cluster leans
+    towards relative to the others.
     """
     if centroids.shape != (3, 2):
         raise ValueError(f"Expected 3x2 centroids, got {centroids.shape}")
 
-    streamer_cluster = int(np.argmax(centroids[:, 0]))
-    room_cluster = int(np.argmax(centroids[:, 1]))
+    std = centroids.std(axis=0)
+    std[std < 1e-12] = 1.0
+    z = (centroids - centroids.mean(axis=0)) / std
+    lean = z[:, 0] - z[:, 1]  # > 0: leans streamer, < 0: leans room/item
 
-    if streamer_cluster == room_cluster:
-        order_room = np.argsort(centroids[:, 1])[::-1]
-        room_cluster = int(order_room[1] if order_room[0] == streamer_cluster else order_room[0])
-
+    streamer_cluster = int(np.argmax(lean))
+    room_cluster = int(np.argmin(lean))
     mixed_cluster = ({0, 1, 2} - {streamer_cluster, room_cluster}).pop()
 
     return {
@@ -177,7 +190,7 @@ def main() -> None:
         _node_raw_features,
         _edge_raw_features,
         _node_type_ids,
-        _full_data,
+        full_data,
         train_data,
         *_rest,
     ) = get_tripartite_link_prediction_data(
@@ -192,7 +205,15 @@ def main() -> None:
         f"(users with >=1 train interaction will be clustered)"
     )
 
-    user_stats = compute_user_hhi_from_train(train_data)
+    mapping = detect_roles(full_data)
+    if mapping.swapped:
+        print(
+            "NOTE: this dataset's columns are swapped, so streamer_hhi/room_hhi below are computed\n"
+            "      from the DETECTED roles, not from the column names. Group labels and figures are\n"
+            "      therefore in terms of the real streamers and rooms."
+        )
+
+    user_stats = compute_user_hhi_from_train(train_data, mapping)
     if len(user_stats) < 3:
         raise RuntimeError(f"Need at least 3 users for KMeans; found {len(user_stats)}.")
 

@@ -169,7 +169,7 @@ def label_clusters(centroids: np.ndarray) -> dict[int, str]:
     return mapping
 
 
-def plot_all(df: pd.DataFrame, out_dir: Path) -> None:
+def plot_all(df: pd.DataFrame, out_dir: Path, feat_cols: list[str]) -> None:
     # Imported lazily so the analysis/CSV path still runs on machines without a plotting stack.
     import matplotlib
     matplotlib.use("Agg")
@@ -216,12 +216,12 @@ def plot_all(df: pd.DataFrame, out_dir: Path) -> None:
     # Fig C: clustering scatter (mirrors the user-side Figure 3)
     plt.figure(figsize=(7, 6))
     sns.scatterplot(
-        data=df, x="audience_hhi", y="item_hhi", hue="bias_group",
+        data=df, x=feat_cols[0], y=feat_cols[1], hue="bias_group",
         palette="Set1", s=28, alpha=0.75, edgecolor="none",
     )
     plt.title("Streamer Clustering based on Interaction Bias", fontsize=14, fontweight="bold")
-    plt.xlabel("Audience Concentration (HHI)", fontsize=12)
-    plt.ylabel("Item Concentration (HHI)", fontsize=12)
+    plt.xlabel(f"Audience Concentration ({feat_cols[0]})", fontsize=12)
+    plt.ylabel(f"Item Concentration ({feat_cols[1]})", fontsize=12)
     plt.legend(title="Streamer Bias Group", fontsize=10, title_fontsize=11)
     p = out_dir / "fig_streamer_clustering_scatter.pdf"
     plt.savefig(p, format="pdf", bbox_inches="tight")
@@ -239,6 +239,11 @@ def get_args() -> argparse.Namespace:
                         help="Drop streamers below this interaction count (HHI is unreliable for tiny supports).")
     parser.add_argument("--sample_streamers", type=int, default=None,
                         help="Optionally subsample this many streamers (after filtering) for the analysis.")
+    parser.add_argument("--cluster_features", type=str, default="raw", choices=("raw", "norm"),
+                        help="Which concentration features to cluster on: 'raw' HHI, or 'norm' "
+                             "size-corrected HHI. Use 'norm' when raw HHI correlates strongly with "
+                             "interaction volume (see the Spearman check), so the clusters reflect "
+                             "behaviour rather than activity level.")
     parser.add_argument("--k_min", type=int, default=2)
     parser.add_argument("--k_max", type=int, default=5)
     parser.add_argument("--n_clusters", type=int, default=None,
@@ -278,11 +283,22 @@ def main() -> None:
         kept = kept.sample(n=args.sample_streamers, random_state=args.random_state)
         print(f"Subsampled {len(kept)} streamers for the analysis.")
 
+    feat_cols = (["audience_hhi", "item_hhi"] if args.cluster_features == "raw"
+                 else ["audience_hhi_norm", "item_hhi_norm"])
+    # The size-corrected HHI is undefined for a support of one (a streamer with a single
+    # distinct viewer or item), so those rows cannot be clustered on it.
+    n_before = len(kept)
+    kept = kept.dropna(subset=feat_cols)
+    if len(kept) < n_before:
+        print(f"Dropped {n_before - len(kept)} streamers whose {args.cluster_features} features are "
+              f"undefined (single distinct viewer or item).")
+
     kept = kept.sort_values("streamer_id").reset_index(drop=True)
-    features_raw = kept[["audience_hhi", "item_hhi"]].to_numpy(dtype=np.float64)
+    print(f"Clustering on {feat_cols}.")
+    features_raw = kept[feat_cols].to_numpy(dtype=np.float64)
 
     # A degenerate axis silently reduces the 2D clustering to 1D, so say so loudly.
-    for j, name in enumerate(("audience_hhi", "item_hhi")):
+    for j, name in enumerate(feat_cols):
         if np.nanstd(features_raw[:, j]) < 1e-12:
             print(
                 f"\n!! WARNING: '{name}' is constant across all streamers "
@@ -312,7 +328,7 @@ def main() -> None:
     print("\n=== Cluster centroids (unstandardized) ===")
     for c in range(k):
         print(f"  cluster {c} ({cluster_to_label[c]}): "
-              f"audience_hhi={centroids_raw[c][0]:.4f}, item_hhi={centroids_raw[c][1]:.4f}")
+              f"{feat_cols[0]}={centroids_raw[c][0]:.4f}, {feat_cols[1]}={centroids_raw[c][1]:.4f}")
 
     kept.to_csv(out_csv, index=False)
     print(f"\nWrote {len(kept)} streamers -> {out_csv}")
@@ -355,7 +371,7 @@ def main() -> None:
         print("\nSkipping figures (--no_plots).")
     else:
         print("\nGenerating figures ...")
-        plot_all(kept, out_dir)
+        plot_all(kept, out_dir, feat_cols)
 
 
 if __name__ == "__main__":

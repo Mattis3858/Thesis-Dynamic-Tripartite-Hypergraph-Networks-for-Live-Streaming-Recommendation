@@ -45,6 +45,7 @@ from train_tripartite_link_prediction import evaluate_tripartite_ranking
 from utils.DataLoader import get_idx_data_loader, get_tripartite_link_prediction_data
 from utils.EarlyStopping import EarlyStopping
 from utils.metrics import mean_metric_dicts
+from utils.roles import detect_roles, role_ids
 from utils.utils import convert_to_gpu, get_neighbor_sampler, get_tripartite_neighbor_sampler
 
 sys.path.append(str(Path(__file__).resolve().parent / "preprocess_data"))
@@ -120,11 +121,12 @@ def load_streamer_group_map(csv_path: Path, raw_to_global: dict[int, int]) -> tu
     return mapping, order + [GROUP_UNKNOWN]
 
 
-def group_indices(test_data, group_map: dict[int, str], group_order: list[str]) -> dict[str, list[int]]:
+def group_indices(test_data, group_map: dict[int, str], group_order: list[str],
+                  streamer_ids: np.ndarray) -> dict[str, list[int]]:
     known = set(group_order) - {GROUP_UNKNOWN}
     idx: dict[str, list[int]] = {g: [] for g in group_order}
     for i in range(test_data.num_interactions):
-        g = group_map.get(int(test_data.streamer_node_ids[i]), GROUP_UNKNOWN)
+        g = group_map.get(int(streamer_ids[i]), GROUP_UNKNOWN)
         idx[g if g in known else GROUP_UNKNOWN].append(i)
     return idx
 
@@ -334,6 +336,10 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--streamer_groups", type=str, default=str(DEFAULT_GROUPS_CSV))
     p.add_argument("--converter_edges", type=str, default=None,
                    help="Edge CSV the dataset was built from; default: read from the dataset meta json.")
+    p.add_argument("--group_role", type=str, default="auto", choices=("auto", "streamer", "item"),
+                   help="Which node column carries the streamers to group by. 'auto' detects it "
+                        "from the data (utils/roles.py) because some datasets have the streamer and "
+                        "room columns swapped; 'streamer'/'item' force a column.")
     p.add_argument("--models", type=str, nargs="+",
                    default=["HTTransformer", "CAWN", "GraphMixer", "DyGFormer"])
     p.add_argument("--run_seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
@@ -431,10 +437,28 @@ def main() -> None:
         eval_candidates = load_eval_candidates(cand_path)
         logger.info("Ranking against fixed candidates: %s", cand_path)
 
-    idx_by_group = group_indices(test_data, group_map, group_order)
+    if args.group_role == "auto":
+        mapping = detect_roles(full_data)
+        streamer_ids = role_ids(test_data, mapping, "streamer")
+    else:
+        attr = "streamer_node_ids" if args.group_role == "streamer" else "item_node_ids"
+        print(f"Grouping by data.{attr} (forced via --group_role {args.group_role}).")
+        streamer_ids = np.asarray(getattr(test_data, attr), dtype=np.int64)
+
+    idx_by_group = group_indices(test_data, group_map, group_order, streamer_ids)
     counts = {g: len(v) for g, v in idx_by_group.items()}
     print("\nTest queries per streamer group: "
           + ", ".join(f"{g}={counts[g]}" for g in group_order))
+
+    if sum(counts[g] for g in group_order if g != GROUP_UNKNOWN) == 0:
+        raise RuntimeError(
+            "Every test query landed in '" + GROUP_UNKNOWN + "', so no group-wise comparison is "
+            "possible. The bias CSV's streamer ids do not match the ids this dataset groups by.\n"
+            "  * Check that analyze_streamer_bias.py ran with the correct --etype_convention: with "
+            "the wrong one it profiles ROOMS and calls them streamers.\n"
+            "  * Check --group_role (currently '" + args.group_role + "') against the role "
+            "detection printed above."
+        )
 
     # ---- evaluate every model on every seed -------------------------------------------
     per_query_by_model: dict[str, list[list[dict]]] = {}
