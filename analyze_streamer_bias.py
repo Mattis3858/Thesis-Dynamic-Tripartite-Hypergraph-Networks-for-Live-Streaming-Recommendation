@@ -361,9 +361,12 @@ def main() -> None:
             "--k_max, or use a larger slice."
         )
     if len(kept) < 30:
-        print(f"!! WARNING: clustering only {len(kept)} streamers. Silhouette-based k selection is "
-              "unstable at this size -- treat the grouping as descriptive, and rely on the "
-              "population-scale slice for the claim that streamer bias exists.")
+        detail = ("Silhouette-based k selection is unstable at this size"
+                  if args.split_mode == "kmeans"
+                  else "the median split is descriptive only at this size")
+        print(f"!! WARNING: grouping only {len(kept)} streamers; {detail} -- treat the grouping as "
+              "descriptive, and rely on the population-scale slice for the claim that streamer "
+              "bias exists.")
 
     if args.sample_streamers is not None and args.sample_streamers < len(kept):
         kept = kept.sample(n=args.sample_streamers, random_state=args.random_state)
