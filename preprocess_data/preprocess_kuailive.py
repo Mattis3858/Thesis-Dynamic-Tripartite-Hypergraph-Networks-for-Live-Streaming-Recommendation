@@ -71,9 +71,34 @@ INTERACTION_LABEL = {
 }
 
 
+def sample_streamers(counts: pd.Series, n: int, how: str, seed: int) -> pd.Index:
+    """
+    挑選要保留的 streamer。
+
+    top        : 互動量前 N（原本的行為，偏向頭部）
+    stratified : 依互動量分成 N 層、每層抽一個，涵蓋長尾（描述性分析建議用這個）
+    random     : 均勻隨機抽
+    """
+    if how == "top":
+        return counts.head(n).index
+
+    rng = np.random.RandomState(seed)
+    ordered = counts.sort_values(ascending=False)
+    if how == "random":
+        pick = rng.choice(len(ordered), size=min(n, len(ordered)), replace=False)
+        return ordered.index[np.sort(pick)]
+    if how == "stratified":
+        bins = np.array_split(np.arange(len(ordered)), min(n, len(ordered)))
+        pick = [int(rng.choice(b)) for b in bins if len(b) > 0]
+        return ordered.index[np.array(sorted(pick))]
+    raise ValueError(f"Unknown streamer sampling strategy: {how}")
+
+
 def load_interactions(
     max_streamers: int | None = None,
     max_users_per_streamer: int | None = None,
+    streamer_sampling: str = "top",
+    seed: int = 2020,
 ) -> pd.DataFrame:
     """
     讀取四種互動檔案，合併成一個 DataFrame，欄位至少包含：
@@ -128,13 +153,24 @@ def load_interactions(
     # 策略：保留「互動次數最多」的前 max_streamers 位 streamer，其餘全部丟掉
     if max_streamers is not None:
         vc = all_df["streamer_id"].value_counts()
-        top_ids = vc.head(max_streamers).index
-        all_df = all_df[all_df["streamer_id"].isin(top_ids)].reset_index(drop=True)
+        keep_ids = sample_streamers(vc, max_streamers, streamer_sampling, seed)
+        all_df = all_df[all_df["streamer_id"].isin(keep_ids)].reset_index(drop=True)
+        print(
+            f"[streamer sampling] strategy={streamer_sampling}, kept {len(keep_ids)} of {len(vc)} streamers"
+        )
 
     # 如果有指定每個 streamer 最多保留多少 user，
     # 策略：對每個 streamer，保留「互動次數最多」的前 max_users_per_streamer 個 user，
     #       這些 user 的所有互動都保留，其餘 user 全部丟掉。
     if max_users_per_streamer is not None:
+        print(
+            "[!! WARNING] --max_users_per_streamer truncates every streamer to the same number of "
+            "top viewers. Audience-side concentration statistics (audience HHI / entropy / repeat "
+            "ratio) then measure the SAMPLING RULE, not real behaviour -- every streamer ends up "
+            "with exactly K viewers. Do NOT use such a slice for analyze_streamer_bias.py; it is "
+            "only appropriate for building a small training subset."
+        )
+
         def _limit_users_per_streamer(df: pd.DataFrame) -> pd.DataFrame:
             user_counts = df["user_id"].value_counts()
             keep_users = user_counts.head(max_users_per_streamer).index
@@ -176,14 +212,41 @@ def main():
         "--max_users_per_streamer",
         type=int,
         default=None,
-        help="每個 streamer 只保留互動次數最多的前 K 位 user；預設 None 表示不限制",
+        help="每個 streamer 只保留互動次數最多的前 K 位 user；預設 None 表示不限制。"
+        "注意：設了這個就不能拿來做 audience 端的集中度分析（見程式內警告）",
+    )
+    parser.add_argument(
+        "--streamer_sampling",
+        type=str,
+        default="top",
+        choices=["top", "stratified", "random"],
+        help="搭配 --max_streamers 使用；top=互動量前 N（預設，偏頭部），"
+        "stratified=依互動量分層抽（涵蓋長尾，描述性分析建議），random=均勻隨機",
+    )
+    parser.add_argument("--seed", type=int, default=2020, help="streamer 抽樣的亂數種子")
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default=None,
+        help=f"輸出資料夾；預設 {OUT_DIR}。分析用的大切片建議另外指定，避免蓋掉訓練資料",
     )
     args = parser.parse_args()
+
+    out_dir = Path(args.out_dir) if args.out_dir else OUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_edges = out_dir / OUT_EDGES.name
+    out_efeat = out_dir / OUT_EFEAT.name
+    out_nfeat = out_dir / OUT_NFEAT.name
+    out_users = out_dir / OUT_USERS.name
+    out_streamers = out_dir / OUT_STREAMERS.name
+    out_rooms = out_dir / OUT_ROOMS.name
 
     # 1. 載入所有互動記錄（可選擇只保留前 N 個 streamer / 每 streamer 前 K 個 user）
     df = load_interactions(
         max_streamers=args.max_streamers,
         max_users_per_streamer=args.max_users_per_streamer,
+        streamer_sampling=args.streamer_sampling,
+        seed=args.seed,
     )
 
     # 2. 建立三種實體的 id map：user, streamer, room
@@ -208,43 +271,32 @@ def main():
     STREAMER_OFFSET = USER_OFFSET + n_users
     ROOM_OFFSET = STREAMER_OFFSET + n_streamers
 
-    def uid_global(x: int) -> int:
-        return USER_OFFSET + int(x)
-
-    def sid_global(x: int) -> int:
-        return STREAMER_OFFSET + int(x)
-
-    def rid_global(x: int) -> int:
-        return ROOM_OFFSET + int(x)
-
     # 4. 針對每一個 (user, streamer, room, ts, label) 產生三條邊
     #    etype: 0=user-room, 1=user-streamer, 2=streamer-room
-    records = []
-    for _, r in tmp.iterrows():
-        ug = uid_global(r["user_id_cid"])
-        sg = sid_global(r["streamer_id_cid"])
-        rg = rid_global(r["room_id_cid"])
-        ts = float(r["timestamp"])
-        lbl = int(r["label"])
-
-        # user-room
-        records.append((ug, rg, ts, lbl, 0))
-        # user-streamer
-        records.append((ug, sg, ts, lbl, 1))
-        # streamer-room
-        records.append((sg, rg, ts, lbl, 2))
+    #    (向量化：逐列 iterrows 在百萬列的切片上會慢到不可用，順序與原本逐列版本相同)
+    ug = USER_OFFSET + tmp["user_id_cid"].to_numpy(dtype=np.int64)
+    sg = STREAMER_OFFSET + tmp["streamer_id_cid"].to_numpy(dtype=np.int64)
+    rg = ROOM_OFFSET + tmp["room_id_cid"].to_numpy(dtype=np.int64)
+    ts_arr = tmp["timestamp"].to_numpy(dtype=np.float64)
+    lbl_arr = tmp["label"].to_numpy(dtype=np.int64)
+    n_rows = len(tmp)
 
     edges = pd.DataFrame(
-        records, columns=["src", "dst", "ts", "label", "etype"]
+        {
+            "src": np.stack([ug, ug, sg], axis=1).reshape(-1),
+            "dst": np.stack([rg, sg, rg], axis=1).reshape(-1),
+            "ts": np.repeat(ts_arr, 3),
+            "label": np.repeat(lbl_arr, 3),
+            "etype": np.tile(np.array([0, 1, 2], dtype=np.int64), n_rows),
+        }
     )
     edges = edges.sort_values(["ts", "etype"]).reset_index(drop=True)
     edges["idx"] = edges.index + 1  # 1-based index
 
     # 5. 邊特徵：簡單 3 維 one-hot (針對 etype)，和 `ml_tripartite_features.npy` 一致
     etype_eye = np.eye(3, dtype=float)
-    edge_feat_rows = [etype_eye[e] for e in edges["etype"].to_numpy()]
     edge_feat = np.vstack(
-        [np.zeros((1, 3), dtype=float), np.array(edge_feat_rows, dtype=float)]
+        [np.zeros((1, 3), dtype=float), etype_eye[edges["etype"].to_numpy()]]
     )
 
     # 6. 節點特徵：先全部填 0，維度 172，和原本 tripartite 節點特徵維度對齊
@@ -252,13 +304,14 @@ def main():
     node_feat = np.zeros((n_nodes + 1, 172), dtype=float)
 
     # 7. 輸出檔案
-    edges.to_csv(OUT_EDGES, index=False)
-    np.save(OUT_EFEAT, edge_feat)
-    np.save(OUT_NFEAT, node_feat)
+    edges.to_csv(out_edges, index=False)
+    np.save(out_efeat, edge_feat)
+    np.save(out_nfeat, node_feat)
 
-    users_map.to_csv(OUT_USERS, index=False)
-    streamers_map.to_csv(OUT_STREAMERS, index=False)
-    rooms_map.to_csv(OUT_ROOMS, index=False)
+    users_map.to_csv(out_users, index=False)
+    streamers_map.to_csv(out_streamers, index=False)
+    rooms_map.to_csv(out_rooms, index=False)
+    print(f"\nWrote outputs to {out_dir}")
 
     # 簡單印出預覽與統計，方便手動檢查
     print("Preview of edges:")
