@@ -292,6 +292,14 @@ def get_args() -> argparse.Namespace:
                         help="Drop streamers below this interaction count (HHI is unreliable for tiny supports).")
     parser.add_argument("--sample_streamers", type=int, default=None,
                         help="Optionally subsample this many streamers (after filtering) for the analysis.")
+    parser.add_argument("--split_mode", type=str, default="kmeans", choices=("kmeans", "median"),
+                        help="How to form the groups. 'kmeans' for a population-scale slice; "
+                             "'median' splits at the median of one concentration axis, which is the "
+                             "honest choice for a handful of streamers, where k-means latches onto a "
+                             "single outlier and produces a group of size one.")
+    parser.add_argument("--median_axis", type=str, default="auto", choices=("auto", "audience", "item"),
+                        help="--split_mode median: which axis to split on ('auto' picks the axis with "
+                             "the larger relative spread).")
     parser.add_argument("--cluster_features", type=str, default="raw", choices=("raw", "norm"),
                         help="Which concentration features to cluster on: 'raw' HHI, or 'norm' "
                              "size-corrected HHI. Use 'norm' when raw HHI correlates strongly with "
@@ -342,7 +350,10 @@ def main() -> None:
     kept = stats[stats["interaction_count"] >= args.min_interactions].copy()
     print(f"Kept {len(kept)} streamers with >= {args.min_interactions} interactions "
           f"(dropped {len(stats) - len(kept)} low-volume streamers).")
-    min_needed = args.k_max + 1 if args.n_clusters is None else args.n_clusters + 1
+    if args.split_mode == "median":
+        min_needed = 2
+    else:
+        min_needed = args.k_max + 1 if args.n_clusters is None else args.n_clusters + 1
     if len(kept) < min_needed:
         raise RuntimeError(
             f"Only {len(kept)} streamers survive --min_interactions {args.min_interactions}; "
@@ -383,6 +394,35 @@ def main() -> None:
 
     features = StandardScaler().fit_transform(features_raw)
 
+    if args.split_mode == "median":
+        if args.median_axis == "auto":
+            spread = np.nanstd(features_raw, axis=0) / np.maximum(np.nanmean(features_raw, axis=0), 1e-12)
+            axis = int(np.argmax(spread))
+            print(f"\nMedian split on '{feat_cols[axis]}' (larger relative spread: "
+                  f"{spread[axis]:.3f} vs {spread[1 - axis]:.3f}).")
+        else:
+            axis = 0 if args.median_axis == "audience" else 1
+            print(f"\nMedian split on '{feat_cols[axis]}'.")
+
+        thr = float(np.median(features_raw[:, axis]))
+        high = features_raw[:, axis] > thr
+        high_label = GROUP_AUDIENCE if axis == 0 else GROUP_ITEM
+        kept["cluster_id"] = high.astype(int)
+        kept["bias_group"] = np.where(high, high_label, GROUP_BROAD)
+        centroids_raw = np.array([
+            features_raw[~high].mean(axis=0) if (~high).any() else [np.nan, np.nan],
+            features_raw[high].mean(axis=0) if high.any() else [np.nan, np.nan],
+        ])
+        cluster_to_label = {0: GROUP_BROAD, 1: high_label}
+        print(f"  threshold = {thr:.4f}  ->  {int(high.sum())} above / {int((~high).sum())} below")
+
+        print("\n=== Group centroids (unstandardized) ===")
+        for c in (0, 1):
+            print(f"  {cluster_to_label[c]}: "
+                  f"{feat_cols[0]}={centroids_raw[c][0]:.4f}, {feat_cols[1]}={centroids_raw[c][1]:.4f}")
+        _finish(kept, args, out_csv, out_dir, feat_cols, id_space)
+        return
+
     if args.n_clusters is not None:
         k = args.n_clusters
         print(f"\nUsing forced k={k}.")
@@ -399,13 +439,27 @@ def main() -> None:
     )
     cluster_to_label = label_clusters(centroids_raw)
     kept["bias_group"] = kept["cluster_id"].map(cluster_to_label)
-    # Tells eval_streamer_group.py whether these ids are already dataset node ids.
-    kept["id_space"] = id_space
 
     print("\n=== Cluster centroids (unstandardized) ===")
     for c in range(k):
         print(f"  cluster {c} ({cluster_to_label[c]}): "
               f"{feat_cols[0]}={centroids_raw[c][0]:.4f}, {feat_cols[1]}={centroids_raw[c][1]:.4f}")
+
+    _finish(kept, args, out_csv, out_dir, feat_cols, id_space)
+
+
+def _finish(kept: pd.DataFrame, args, out_csv: Path, out_dir: Path,
+            feat_cols: list[str], id_space: str) -> None:
+    """Shared reporting tail for both split modes: CSV, group summary, sanity check, figures."""
+    # Tells eval_streamer_group.py whether these ids are already dataset node ids.
+    kept = kept.copy()
+    kept["id_space"] = id_space
+
+    sizes = kept["bias_group"].value_counts()
+    if (sizes < 2).any():
+        singletons = ", ".join(f"{g} (n={n})" for g, n in sizes.items() if n < 2)
+        print(f"\n!! WARNING: group(s) of size one: {singletons}. Such a group's metrics describe a "
+              "single streamer, not a group -- prefer --split_mode median at this sample size.")
 
     kept.to_csv(out_csv, index=False)
     print(f"\nWrote {len(kept)} streamers -> {out_csv}")
