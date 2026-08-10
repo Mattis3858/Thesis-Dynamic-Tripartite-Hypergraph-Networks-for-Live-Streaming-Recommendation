@@ -144,6 +144,50 @@ def compute_streamer_stats(df: pd.DataFrame, convention: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def compute_streamer_stats_from_dataset(train_data, mapping) -> pd.DataFrame:
+    """
+    Same per-streamer statistics, but read from an already-built tripartite dataset.
+
+    Used to group the handful of streamers a trained model actually saw, so the group-wise
+    evaluation needs no access to the original edge table. Roles come from utils.roles rather
+    than from the column names, and only the TRAIN split is used (no leakage into the test
+    period, matching analyze_user_bias.py).
+    """
+    from utils.roles import role_ids
+
+    u_ids = train_data.user_node_ids
+    s_ids = role_ids(train_data, mapping, "streamer")
+    r_ids = role_ids(train_data, mapping, "room")
+
+    user_counts: dict[int, Counter] = defaultdict(Counter)
+    item_counts: dict[int, Counter] = defaultdict(Counter)
+    for u, s, r in zip(u_ids, s_ids, r_ids):
+        user_counts[int(s)][int(u)] += 1
+        item_counts[int(s)][int(r)] += 1
+
+    rows = []
+    for s in sorted(user_counts):
+        uc, ic = user_counts[s], item_counts[s]
+        n_int = sum(uc.values())
+        repeat = sum(c for c in uc.values() if c >= 2)
+        rows.append(
+            {
+                "streamer_id": s,
+                "interaction_count": n_int,
+                "num_users": len(uc),
+                "num_items": len(ic),
+                "audience_hhi": _hhi(uc),
+                "audience_hhi_norm": _normalized_hhi(uc),
+                "audience_entropy": _entropy(uc),
+                "item_hhi": _hhi(ic),
+                "item_hhi_norm": _normalized_hhi(ic),
+                "item_entropy": _entropy(ic),
+                "repeat_viewer_ratio": (repeat / n_int) if n_int > 0 else float("nan"),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def select_k(features: np.ndarray, k_min: int, k_max: int, random_state: int) -> tuple[int, list[tuple[int, float]]]:
     """Pick k by silhouette score instead of hard-coding k=3."""
     k_max = min(k_max, len(features) - 1)
@@ -231,10 +275,19 @@ def plot_all(df: pd.DataFrame, out_dir: Path, feat_cols: list[str]) -> None:
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Streamer-level HHI bias analysis and clustering.")
-    parser.add_argument("--edges", type=str, required=True,
-                        help="Pairwise edge CSV (src,dst,ts,label,etype,idx), e.g. a large ml_kuailive_edges.csv slice.")
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("--edges", type=str,
+                     help="Pairwise edge CSV (src,dst,ts,label,etype,idx), e.g. a large ml_kuailive_edges.csv slice.")
+    src.add_argument("--from_dataset", type=str,
+                     help="Instead of an edge CSV, profile the streamers of an already-built "
+                          "tripartite dataset (e.g. kuailive_tripartite), using its TRAIN split. "
+                          "Streamer ids are then global node ids, ready for eval_streamer_group.py.")
+    parser.add_argument("--data_dir", type=str, default=None,
+                        help="--from_dataset only: dataset folder (default processed_data/<name>).")
+    parser.add_argument("--val_ratio", type=float, default=0.15, help="--from_dataset only.")
+    parser.add_argument("--test_ratio", type=float, default=0.15, help="--from_dataset only.")
     parser.add_argument("--etype_convention", type=str, default="source", choices=sorted(_CONVENTIONS),
-                        help="Which etype convention the file uses; see remap_kuailive_etypes.py.")
+                        help="--edges only: which etype convention the file uses; see remap_kuailive_etypes.py.")
     parser.add_argument("--min_interactions", type=int, default=30,
                         help="Drop streamers below this interaction count (HHI is unreliable for tiny supports).")
     parser.add_argument("--sample_streamers", type=int, default=None,
@@ -265,19 +318,41 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_csv = Path(args.out_csv) if args.out_csv else out_dir / "streamer_bias_groups.csv"
 
-    print(f"Loading edges from {args.edges} (convention={args.etype_convention}) ...")
-    df_edges = load_edges(Path(args.edges), not args.keep_label_duplicates)
-    stats = compute_streamer_stats(df_edges, args.etype_convention)
-    print(f"Found {len(stats)} streamers in the slice.")
+    if args.from_dataset:
+        from utils.DataLoader import get_tripartite_link_prediction_data
+        from utils.roles import detect_roles
+
+        print(f"Loading tripartite dataset '{args.from_dataset}' (train split used for the stats) ...")
+        loaded = get_tripartite_link_prediction_data(
+            dataset_name=args.from_dataset, val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio, data_dir=args.data_dir,
+        )
+        full_data, train_data = loaded[3], loaded[4]
+        mapping = detect_roles(full_data)
+        stats = compute_streamer_stats_from_dataset(train_data, mapping)
+        id_space = "global_node_id"
+        print(f"Found {len(stats)} streamers in the dataset's train split.")
+    else:
+        print(f"Loading edges from {args.edges} (convention={args.etype_convention}) ...")
+        df_edges = load_edges(Path(args.edges), not args.keep_label_duplicates)
+        stats = compute_streamer_stats(df_edges, args.etype_convention)
+        id_space = "raw_edge_id"
+        print(f"Found {len(stats)} streamers in the slice.")
 
     kept = stats[stats["interaction_count"] >= args.min_interactions].copy()
     print(f"Kept {len(kept)} streamers with >= {args.min_interactions} interactions "
           f"(dropped {len(stats) - len(kept)} low-volume streamers).")
-    if len(kept) < 10:
+    min_needed = args.k_max + 1 if args.n_clusters is None else args.n_clusters + 1
+    if len(kept) < min_needed:
         raise RuntimeError(
             f"Only {len(kept)} streamers survive --min_interactions {args.min_interactions}; "
-            "lower the threshold or use a larger slice."
+            f"at least {min_needed} are needed for the requested k. Lower the threshold, lower "
+            "--k_max, or use a larger slice."
         )
+    if len(kept) < 30:
+        print(f"!! WARNING: clustering only {len(kept)} streamers. Silhouette-based k selection is "
+              "unstable at this size -- treat the grouping as descriptive, and rely on the "
+              "population-scale slice for the claim that streamer bias exists.")
 
     if args.sample_streamers is not None and args.sample_streamers < len(kept):
         kept = kept.sample(n=args.sample_streamers, random_state=args.random_state)
@@ -324,6 +399,8 @@ def main() -> None:
     )
     cluster_to_label = label_clusters(centroids_raw)
     kept["bias_group"] = kept["cluster_id"].map(cluster_to_label)
+    # Tells eval_streamer_group.py whether these ids are already dataset node ids.
+    kept["id_space"] = id_space
 
     print("\n=== Cluster centroids (unstandardized) ===")
     for c in range(k):

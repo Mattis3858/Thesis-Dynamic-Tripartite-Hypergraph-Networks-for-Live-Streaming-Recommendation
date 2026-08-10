@@ -91,11 +91,22 @@ def build_raw_to_global_streamer_map(dataset_name: str, data_dir: str | None,
     return {int(k): int(v) for k, v in streamer_map.items()}
 
 
-def load_streamer_group_map(csv_path: Path, raw_to_global: dict[int, int]) -> tuple[dict[int, str], list[str]]:
+def groups_use_global_ids(csv_path: Path) -> bool:
+    """analyze_streamer_bias.py --from_dataset already emits dataset node ids; nothing to remap."""
+    df = pd.read_csv(csv_path, nrows=1)
+    return "id_space" in df.columns and str(df["id_space"].iloc[0]) == "global_node_id"
+
+
+def load_streamer_group_map(csv_path: Path, raw_to_global: dict[int, int] | None) -> tuple[dict[int, str], list[str]]:
     df = pd.read_csv(csv_path)
     for col in ("streamer_id", "bias_group"):
         if col not in df.columns:
             raise ValueError(f"{csv_path} must contain columns streamer_id and bias_group.")
+
+    if raw_to_global is None:  # ids are already dataset node ids
+        mapping = {int(row.streamer_id): str(row.bias_group) for row in df.itertuples(index=False)}
+        print(f"Loaded {len(mapping)} streamer groups (ids already in dataset node space).")
+        return mapping, sorted({g for g in mapping.values()}) + [GROUP_UNKNOWN]
 
     mapping: dict[int, str] = {}
     missing = 0
@@ -396,8 +407,12 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("eval_streamer_group")
 
-    raw_to_global = build_raw_to_global_streamer_map(args.dataset_name, args.data_dir, args.converter_edges)
-    group_map, group_order = load_streamer_group_map(Path(args.streamer_groups), raw_to_global)
+    groups_path = Path(args.streamer_groups)
+    raw_to_global = (
+        None if groups_use_global_ids(groups_path)
+        else build_raw_to_global_streamer_map(args.dataset_name, args.data_dir, args.converter_edges)
+    )
+    group_map, group_order = load_streamer_group_map(groups_path, raw_to_global)
 
     (
         node_raw_features, edge_raw_features, node_type_ids, full_data, train_data,
