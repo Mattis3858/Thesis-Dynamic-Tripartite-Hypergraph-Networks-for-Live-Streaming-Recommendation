@@ -47,9 +47,12 @@ import torch
 
 from eval_streamer_group import (
     build_model,
+    cache_path,
     load_checkpoint,
+    load_per_query,
     paired_test,
     resolve_checkpoint,
+    save_per_query,
     seed_averaged_per_query,
 )
 from train_tripartite_link_prediction import evaluate_tripartite_ranking
@@ -311,6 +314,12 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--eval_candidates_path", type=str, default=None)
     p.add_argument("--no_fixed_eval_candidates", action="store_true",
                    help="Legacy uniform negatives; NOT comparable to the main table.")
+    p.add_argument("--cache_dir", type=str, default=None,
+                   help="Where per-query metrics are cached so a crash or a statistics tweak does "
+                        "not cost another full evaluation pass. Default: "
+                        "experiment_results/.per_query_cache")
+    p.add_argument("--no_cache", action="store_true",
+                   help="Ignore cached per-query metrics and re-evaluate everything.")
     p.add_argument("--n_bootstrap", type=int, default=2000)
     p.add_argument("--no_plots", action="store_true")
     p.add_argument("--out_csv", type=str, default=None,
@@ -393,26 +402,42 @@ def main() -> None:
     per_query_by_strategy: dict[str, list[list[dict]]] = {s: [] for s in strategies}
     per_seed_rows: list[dict] = []
 
+    cache_dir = Path(args.cache_dir) if args.cache_dir else (ROOT / "experiment_results" / ".per_query_cache")
+
     for seed in args.run_seeds:
         folder, stem = resolve_checkpoint(args.model_name, args.dataset_name, seed, args.suffix)
-        model = build_model(args.model_name, args, node_raw_features=node_raw_features,
-                            edge_raw_features=edge_raw_features, node_type_ids=node_type_ids,
-                            neighbor_sampler=train_sampler, device=device)
-        load_checkpoint(model, folder, stem, args.model_name, logger)
-        model = convert_to_gpu(model, device=device)
+        model = None  # built lazily: a fully cached seed needs no GPU work at all
 
         for strategy in strategies:
-            proxy_fn = make_proxy_fn(strategy, args.cold_role, tables, popular)
-            print(f"Evaluating seed {seed} | strategy {strategy} ...")
-            with coldstart_context(model, args.cold_role, proxy_fn):
-                _loss, agg, per_query = evaluate_tripartite_ranking(
-                    model=model, neighbor_sampler=full_sampler, data=test_data,
-                    idx_data_loader=test_loader, node_type_ids=node_type_ids, device=device,
-                    num_negatives=args.num_ranking_negatives,
-                    eval_rng=np.random.RandomState(seed=eval_rank_seed),
-                    return_per_query=True, eval_candidates=eval_candidates,
-                )
-            per_query_by_strategy[strategy].append(list(per_query))
+            cache_file = cache_path(
+                cache_dir, args.dataset_name, f"{stem}__cold-{args.cold_role}__{strategy}", eval_rank_seed
+            )
+            if cache_file.is_file() and not args.no_cache:
+                per_query = load_per_query(cache_file)
+                agg = {k: float(np.nanmean([q.get(k, np.nan) for q in per_query])) for k in METRIC_KEYS}
+                print(f"Reusing cached seed {seed} | strategy {strategy} ({cache_file.name}).")
+            else:
+                if model is None:
+                    model = build_model(args.model_name, args, node_raw_features=node_raw_features,
+                                        edge_raw_features=edge_raw_features, node_type_ids=node_type_ids,
+                                        neighbor_sampler=train_sampler, device=device)
+                    load_checkpoint(model, folder, stem, args.model_name, logger)
+                    model = convert_to_gpu(model, device=device)
+
+                proxy_fn = make_proxy_fn(strategy, args.cold_role, tables, popular)
+                print(f"Evaluating seed {seed} | strategy {strategy} ...")
+                with coldstart_context(model, args.cold_role, proxy_fn):
+                    _loss, agg, per_query = evaluate_tripartite_ranking(
+                        model=model, neighbor_sampler=full_sampler, data=test_data,
+                        idx_data_loader=test_loader, node_type_ids=node_type_ids, device=device,
+                        num_negatives=args.num_ranking_negatives,
+                        eval_rng=np.random.RandomState(seed=eval_rank_seed),
+                        return_per_query=True, eval_candidates=eval_candidates,
+                    )
+                per_query = list(per_query)
+                save_per_query(cache_file, per_query)
+
+            per_query_by_strategy[strategy].append(per_query)
             per_seed_rows.append({"strategy": strategy, "seed": seed,
                                   **{k: agg.get(k, float("nan")) for k in METRIC_KEYS}})
 
