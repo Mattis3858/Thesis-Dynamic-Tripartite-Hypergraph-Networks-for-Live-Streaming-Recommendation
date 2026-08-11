@@ -205,6 +205,28 @@ def build_model(model_name: str, args, *, node_raw_features, edge_raw_features, 
 # --------------------------------------------------------------------------------------
 # statistics
 # --------------------------------------------------------------------------------------
+def cache_path(cache_dir: Path, dataset: str, stem: str, eval_seed: int) -> Path:
+    return cache_dir / f"{dataset}__{stem}__evalseed{eval_seed}.npz"
+
+
+def save_per_query(path: Path, per_query: list[dict]) -> None:
+    """Persist per-query metrics so re-running only the statistics costs seconds, not hours."""
+    if not per_query:
+        return
+    keys = sorted(per_query[0].keys())
+    arrays = {k: np.array([q.get(k, np.nan) for q in per_query], dtype=np.float64) for k in keys}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **arrays)
+
+
+def load_per_query(path: Path) -> list[dict]:
+    with np.load(path) as z:
+        keys = list(z.keys())
+        cols = {k: z[k] for k in keys}
+    n = len(next(iter(cols.values())))
+    return [{k: float(cols[k][i]) for k in keys} for i in range(n)]
+
+
 def seed_averaged_per_query(per_query_by_seed: list[list[dict]], metric: str) -> np.ndarray:
     """One value per test query: its metric averaged over the seeds."""
     mat = np.array([[q.get(metric, np.nan) for q in pq] for pq in per_query_by_seed], dtype=np.float64)
@@ -231,8 +253,9 @@ def paired_test(a: np.ndarray, b: np.ndarray, n_boot: int, rng: np.random.Random
         out["p_value"] = float(wilcoxon(a, b, zero_method="wilcox").pvalue)
     except ValueError:
         pass
-    boot = np.array([np.mean(rng.choice(diff, size=n, replace=True)) for _ in range(n_boot)])
-    out["ci_low"], out["ci_high"] = (float(np.percentile(boot, 2.5)), float(np.percentile(boot, 97.5)))
+    if n_boot > 0:  # per-seed rows skip the CI, so guard against an empty bootstrap sample
+        boot = np.array([np.mean(rng.choice(diff, size=n, replace=True)) for _ in range(n_boot)])
+        out["ci_low"], out["ci_high"] = (float(np.percentile(boot, 2.5)), float(np.percentile(boot, 97.5)))
     return out
 
 
@@ -382,6 +405,11 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--eval_candidates_path", type=str, default=None)
     p.add_argument("--no_fixed_eval_candidates", action="store_true",
                    help="Legacy on-the-fly uniform negatives; NOT comparable to the main table.")
+    p.add_argument("--cache_dir", type=str, default=None,
+                   help="Where per-query metrics are cached so re-running only the statistics is "
+                        "instant. Default: experiment_results/.per_query_cache")
+    p.add_argument("--no_cache", action="store_true",
+                   help="Ignore cached per-query metrics and re-evaluate every checkpoint.")
     p.add_argument("--n_bootstrap", type=int, default=2000)
     p.add_argument("--no_plots", action="store_true")
     p.add_argument("--out_csv", type=str,
@@ -460,6 +488,8 @@ def main() -> None:
         print(f"Grouping by data.{attr} (forced via --group_role {args.group_role}).")
         streamer_ids = np.asarray(getattr(test_data, attr), dtype=np.int64)
 
+    cache_dir = Path(args.cache_dir) if args.cache_dir else (ROOT / "experiment_results" / ".per_query_cache")
+
     idx_by_group = group_indices(test_data, group_map, group_order, streamer_ids)
     counts = {g: len(v) for g, v in idx_by_group.items()}
     print("\nTest queries per streamer group: "
@@ -483,21 +513,29 @@ def main() -> None:
         per_query_by_model[model_name] = []
         for seed in args.run_seeds:
             folder, stem = resolve_checkpoint(model_name, args.dataset_name, seed, suffixes.get(model_name))
-            model = build_model(model_name, args, node_raw_features=node_raw_features,
-                                edge_raw_features=edge_raw_features, node_type_ids=node_type_ids,
-                                neighbor_sampler=train_sampler, device=device)
-            load_checkpoint(model, folder, stem, model_name, logger)
-            model = convert_to_gpu(model, device=device)
+            cache_file = cache_path(cache_dir, args.dataset_name, stem, eval_rank_seed)
 
-            print(f"Evaluating {model_name} seed {seed}  ({stem}) ...")
-            _loss, _agg, per_query = evaluate_tripartite_ranking(
-                model=model, neighbor_sampler=full_sampler, data=test_data,
-                idx_data_loader=test_loader, node_type_ids=node_type_ids, device=device,
-                num_negatives=args.num_ranking_negatives,
-                eval_rng=np.random.RandomState(seed=eval_rank_seed),
-                return_per_query=True, eval_candidates=eval_candidates,
-            )
-            per_query = list(per_query)
+            if cache_file.is_file() and not args.no_cache:
+                per_query = load_per_query(cache_file)
+                print(f"Reusing cached per-query metrics for {model_name} seed {seed} "
+                      f"({cache_file.name}); pass --no_cache to re-evaluate.")
+            else:
+                model = build_model(model_name, args, node_raw_features=node_raw_features,
+                                    edge_raw_features=edge_raw_features, node_type_ids=node_type_ids,
+                                    neighbor_sampler=train_sampler, device=device)
+                load_checkpoint(model, folder, stem, model_name, logger)
+                model = convert_to_gpu(model, device=device)
+
+                print(f"Evaluating {model_name} seed {seed}  ({stem}) ...")
+                _loss, _agg, per_query = evaluate_tripartite_ranking(
+                    model=model, neighbor_sampler=full_sampler, data=test_data,
+                    idx_data_loader=test_loader, node_type_ids=node_type_ids, device=device,
+                    num_negatives=args.num_ranking_negatives,
+                    eval_rng=np.random.RandomState(seed=eval_rank_seed),
+                    return_per_query=True, eval_candidates=eval_candidates,
+                )
+                per_query = list(per_query)
+                save_per_query(cache_file, per_query)
             per_query_by_model[model_name].append(per_query)
 
             for g in group_order:
