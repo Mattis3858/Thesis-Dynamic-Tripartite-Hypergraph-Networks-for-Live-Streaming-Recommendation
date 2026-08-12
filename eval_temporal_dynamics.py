@@ -191,14 +191,29 @@ def main() -> None:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
+        # Grayscale-safe: the curves are told apart by LINE STYLE, MARKER and gray level rather
+        # than by hue, because the point of this figure is which curve overtakes which -- a
+        # distinction that vanishes in black-and-white print if only colour separates them.
+        styles = [
+            {"ls": "-", "marker": "o", "gray": "0.0"},
+            {"ls": "--", "marker": "s", "gray": "0.45"},
+            {"ls": ":", "marker": "^", "gray": "0.0"},
+            {"ls": "-.", "marker": "D", "gray": "0.45"},
+            {"ls": (0, (3, 1, 1, 1)), "marker": "v", "gray": "0.7"},
+        ]
         plt.figure(figsize=(8, 4.5))
-        colors = plt.cm.tab10(np.linspace(0, 1, len(combos)))
+        n_mark = 12  # markers thin out so they annotate the curve instead of hiding it
         for ci, (v, w) in enumerate(combos):
-            plt.plot(grid, probs[ci], color=colors[ci], label=f"(s={v}, r={w})", linewidth=2)
+            st = styles[ci % len(styles)]
+            plt.plot(grid, probs[ci], color=st["gray"], linestyle=st["ls"], linewidth=1.8,
+                     marker=st["marker"], markersize=5, markevery=max(1, len(grid) // n_mark),
+                     markerfacecolor="white", markeredgecolor=st["gray"],
+                     label=f"(s={v}, r={w})")
             for t in uc[u0][(v, w)]:  # real interaction times of this combo
-                plt.axvline(t, color=colors[ci], alpha=0.25, linestyle=":", linewidth=1)
+                plt.axvline(t, color=st["gray"], alpha=0.35, linestyle=st["ls"], linewidth=0.8)
         plt.xlabel("query time t"); plt.ylabel("predicted probability")
-        plt.title(f"Time-varying predictions for user {u0} (dotted = real interactions)")
+        plt.title(f"Time-varying predictions for user {u0} (vertical lines = real interactions)")
+        plt.grid(True, alpha=0.25, linewidth=0.6)
         plt.legend(fontsize=8); plt.tight_layout()
         fig_path = f"{args.out_prefix}_user{u0}.pdf"
         plt.savefig(fig_path, bbox_inches="tight"); plt.close()

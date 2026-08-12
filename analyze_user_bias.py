@@ -29,6 +29,14 @@ BIAS_STREAMER = "Streamer-biased"
 BIAS_ITEM = "Item-biased"
 BIAS_MIXED = "Mixed"
 
+# Grayscale-safe encoding: shape + fill lightness + ellipse line style, so the clusters remain
+# distinguishable when the paper is printed in black and white (colour carries no information).
+GROUP_STYLE = {
+    BIAS_STREAMER: {"marker": "o", "face": "#e0e0e0", "line": "-"},
+    BIAS_MIXED: {"marker": "^", "face": "#8c8c8c", "line": "--"},
+    BIAS_ITEM: {"marker": "s", "face": "#1a1a1a", "line": ":"},
+}
+
 
 def _herfindahl(counts: Counter) -> float:
     """HHI = sum_s (p_s)^2 over interaction counts."""
@@ -122,10 +130,37 @@ def run_clustering(
     return np.asarray(users), cluster_ids, cluster_to_label, centroids
 
 
+def _cluster_ellipse(ax, xy: np.ndarray, n_std: float = 2.0,
+                     min_extent: tuple[float, float] = (0.0, 0.0), **kwargs) -> None:
+    """
+    Outline a cluster with a 2-sigma covariance ellipse.
+
+    Drawn instead of a convex hull because a cluster whose points share an identical coordinate
+    (e.g. every member at streamer HHI = 1.0) is degenerate, and a hull would raise; a covariance
+    ellipse with a small regularizer still renders as a thin, informative sliver.
+    """
+    from matplotlib.patches import Ellipse
+
+    if len(xy) < 3:
+        return
+    mean = xy.mean(axis=0)
+    cov = np.cov(xy, rowvar=False) + np.eye(2) * 1e-9
+    vals, vecs = np.linalg.eigh(cov)
+    order = vals.argsort()[::-1]
+    vals, vecs = np.maximum(vals[order], 0.0), vecs[:, order]
+    angle = float(np.degrees(np.arctan2(vecs[1, 0], vecs[0, 0])))
+    width, height = 2.0 * n_std * np.sqrt(vals)
+    # A cluster collapsed onto one axis would otherwise draw a zero-width sliver that no printer
+    # can render; floor each extent at a fraction of the plotted range so it stays visible.
+    ax.add_patch(
+        Ellipse(xy=tuple(mean), width=max(width, min_extent[0]), height=max(height, min_extent[1]),
+                angle=angle, fill=False, **kwargs)
+    )
+
+
 def plot_and_save_visualizations(df: pd.DataFrame, out_dir: Path):
     """Generate and save academic plots for Figure 2 and Figure 3."""
     sns.set_theme(style="whitegrid")
-    colors = {BIAS_STREAMER: "#e74c3c", BIAS_ITEM: "#3498db", BIAS_MIXED: "#2ecc71"}
 
     # --- Plot 1: Distributions (For Figure 2 in Thesis) ---
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
@@ -147,22 +182,55 @@ def plot_and_save_visualizations(df: pd.DataFrame, out_dir: Path):
     print(f"Saved distribution plot to: {dist_path}")
 
     # --- Plot 2: Scatter & Clustering (For Figure 3 in Thesis) ---
-    plt.figure(figsize=(7, 6))
-    sns.scatterplot(
-        data=df, 
-        x="streamer_hhi", 
-        y="room_hhi", 
-        hue="bias_group", 
-        palette=colors,
-        s=60, 
-        alpha=0.8,
-        edgecolor="w"
-    )
-    plt.title("User Clustering based on Interaction Bias", fontsize=14, fontweight="bold")
-    plt.xlabel("Streamer Concentration (HHI)", fontsize=12)
-    plt.ylabel("Item Concentration (HHI)", fontsize=12)
-    plt.legend(title="User Bias Group", fontsize=10, title_fontsize=11)
-    
+    # Encoded so the groups stay separable when the paper is printed in black and white:
+    # marker SHAPE, fill LIGHTNESS, an enclosing ellipse with its own LINE STYLE, and a label
+    # written next to each centroid. Colour alone is not used to carry any information.
+    fig, ax = plt.subplots(figsize=(7.2, 6))
+    ax.grid(True, alpha=0.3, linewidth=0.6)
+    ax.set_axisbelow(True)
+
+    x_all = df["streamer_hhi"].to_numpy(dtype=float)
+    y_all = df["room_hhi"].to_numpy(dtype=float)
+    x_span = max(float(x_all.max() - x_all.min()), 1e-6)
+    y_span = max(float(y_all.max() - y_all.min()), 1e-6)
+    x_mid = float(x_all.min()) + x_span / 2
+    min_extent = (0.03 * x_span, 0.03 * y_span)
+
+    for group in (BIAS_STREAMER, BIAS_MIXED, BIAS_ITEM):
+        sub = df[df["bias_group"] == group]
+        if sub.empty:
+            continue
+        style = GROUP_STYLE[group]
+        xy = sub[["streamer_hhi", "room_hhi"]].to_numpy(dtype=float)
+
+        ax.scatter(
+            xy[:, 0], xy[:, 1],
+            marker=style["marker"], s=52,
+            facecolor=style["face"], edgecolor="black", linewidth=0.5, alpha=0.85,
+            label=f"{group} (n={len(sub)})", zorder=3,
+        )
+        _cluster_ellipse(ax, xy, min_extent=min_extent, edgecolor="black",
+                         linestyle=style["line"], linewidth=1.4, zorder=4)
+
+        centroid = xy.mean(axis=0)
+        ax.scatter(*centroid, marker="X", s=150, facecolor="white", edgecolor="black",
+                   linewidth=1.4, zorder=5)
+        # Clusters sitting against the right edge (HHI saturated at 1.0) get their label placed to
+        # the left, into empty space, instead of on top of the neighbouring cluster's points.
+        to_left = centroid[0] > x_mid
+        ax.annotate(
+            group, xy=centroid,
+            xytext=(-12, 10) if to_left else (12, 10), textcoords="offset points",
+            ha="right" if to_left else "left", fontsize=10, fontweight="bold", zorder=6,
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="black", linewidth=0.6),
+        )
+
+    ax.set_title("User Clustering based on Interaction Bias", fontsize=14, fontweight="bold")
+    ax.set_xlabel("Streamer Concentration (HHI)", fontsize=12)
+    ax.set_ylabel("Item Concentration (HHI)", fontsize=12)
+    ax.legend(title="User Bias Group", fontsize=10, title_fontsize=11, loc="upper left",
+              framealpha=0.95)
+
     scatter_path = out_dir / "fig3_user_clustering_scatter.pdf"
     plt.savefig(scatter_path, format='pdf', bbox_inches='tight')
     plt.close()

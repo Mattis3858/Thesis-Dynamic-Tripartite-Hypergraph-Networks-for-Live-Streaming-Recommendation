@@ -492,13 +492,16 @@ def _finish(kept: pd.DataFrame, args, out_csv: Path, out_dir: Path,
     # Small-sample sanity check: is the concentration merely a volume artifact?
     log_vol = np.log10(kept["interaction_count"].to_numpy(dtype=np.float64))
     print("\n=== Small-sample sanity check (Spearman vs. log10 volume) ===")
-    for col in ("audience_hhi", "item_hhi"):
+    print("    (the size-corrected '_norm' rows are the ones that matter when clustering on them)")
+    for col in ("audience_hhi", "item_hhi", "audience_hhi_norm", "item_hhi_norm"):
         vals = kept[col].to_numpy(dtype=np.float64)
-        if np.nanstd(vals) < 1e-12:
-            print(f"  {col:12s}: undefined (constant column)")
+        ok = np.isfinite(vals) & np.isfinite(log_vol)  # _norm is undefined for a support of one
+        if ok.sum() < 3 or np.nanstd(vals[ok]) < 1e-12:
+            print(f"  {col:18s}: undefined (constant or too few defined values)")
             continue
-        rho, pval = spearmanr(vals, log_vol)
-        print(f"  {col:12s}: rho = {rho:+.4f} (p = {pval:.3g})")
+        rho, pval = spearmanr(vals[ok], log_vol[ok])
+        n_note = "" if ok.all() else f"  [n={int(ok.sum())} of {len(vals)}]"
+        print(f"  {col:18s}: rho = {rho:+.4f} (p = {pval:.3g}){n_note}")
     print("  A strongly negative rho would mean the concentration is a low-volume artifact.")
 
     if args.no_plots:
