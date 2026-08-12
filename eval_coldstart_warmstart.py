@@ -314,6 +314,10 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--eval_candidates_path", type=str, default=None)
     p.add_argument("--no_fixed_eval_candidates", action="store_true",
                    help="Legacy uniform negatives; NOT comparable to the main table.")
+    p.add_argument("--strategies", type=str, nargs="+", default=None,
+                   help="Subset of strategies to run (e.g. --strategies zero). Default: all four. "
+                        "Running 'zero' alone is the cheap way to get seed-level statistics for the "
+                        "plain cold-start table.")
     p.add_argument("--cache_dir", type=str, default=None,
                    help="Where per-query metrics are cached so a crash or a statistics tweak does "
                         "not cost another full evaluation pass. Default: "
@@ -395,6 +399,11 @@ def main() -> None:
     tables, popular = build_proxy_tables(train_data, args.cold_role)
     partners = PARTNERS[args.cold_role]
     strategies = [STRATEGY_ZERO, STRATEGY_POPULAR] + [f"proxy_{p}" for p in partners]
+    if args.strategies:
+        unknown = [s for s in args.strategies if s not in strategies]
+        if unknown:
+            raise ValueError(f"Unknown strategies {unknown}; available: {strategies}")
+        strategies = list(args.strategies)
     print(f"\nCold role: {args.cold_role} | strategies: {strategies}")
     for p in partners:
         print(f"  proxy_{p}: {len(tables[p])} distinct {p} keys with train history")
@@ -425,6 +434,20 @@ def main() -> None:
                     model = convert_to_gpu(model, device=device)
 
                 proxy_fn = make_proxy_fn(strategy, args.cold_role, tables, popular)
+                if proxy_fn is not None:
+                    ids_probe = {
+                        "user": test_data.user_node_ids,
+                        "streamer": test_data.streamer_node_ids,
+                        "item": test_data.item_node_ids,
+                    }
+                    usable = int((proxy_fn(ids_probe) > 0).mean() * 100)
+                    if usable == 0:
+                        print(f"!! WARNING: strategy '{strategy}' finds no usable proxy for ANY query, so "
+                              f"it degenerates to 'zero'. This happens when the partner entity maps "
+                              f"one-to-one onto the cold role (e.g. each room belongs to a single "
+                              f"streamer), leaving only the masked node itself as a candidate.")
+                    else:
+                        print(f"  strategy '{strategy}': a proxy is available for {usable}% of queries.")
                 print(f"Evaluating seed {seed} | strategy {strategy} ...")
                 with coldstart_context(model, args.cold_role, proxy_fn):
                     _loss, agg, per_query = evaluate_tripartite_ranking(
